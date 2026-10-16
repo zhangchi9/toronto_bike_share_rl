@@ -6,7 +6,6 @@ Usage:
     python app.py                # http://localhost:8050
 """
 import pandas as pd
-import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, State, no_update
 
 from data_loader import load_stations, load_day
@@ -32,7 +31,8 @@ _STATION_STORE = {
 def get_day_df(date_str: str) -> pd.DataFrame:
     if date_str not in _day_cache:
         df = load_day(date_str, STATIONS_DF)
-        df = df.dropna(subset=["Start_Time", "End_Time", "start_lat", "start_lon", "end_lat", "end_lon"])
+        df = df.dropna(subset=["Start_Time", "End_Time",
+                                "start_lat", "start_lon", "end_lat", "end_lon"])
         day_start = pd.Timestamp(date_str)
         df["start_min"] = (
             (df["Start_Time"] - day_start).dt.total_seconds() / 60
@@ -59,144 +59,69 @@ def serialize_trips(df: pd.DataFrame) -> dict:
     }
 
 
-def build_base_figure() -> go.Figure:
-    """
-    Minimal figure — just enough to create the Mapbox GL map.
-    All animated data (station colors, arcs) is rendered via raw Mapbox GL
-    API in the clientside JS callback, bypassing Plotly entirely so the
-    map viewport is NEVER reset.
-    """
+# ── Map figure ────────────────────────────────────────────────────────────────
+# Every animation tick hands dcc.Graph a brand-new figure. To keep the user's
+# zoom/pan, the clientside callback copies the live camera (center, zoom,
+# bearing, pitch) into the outgoing layout, so Plotly.react has no view change
+# to apply. `uirevision` alone is not enough: Plotly does not record wheel-zoom
+# / drag as GUI edits for map subplots, so it snaps back to zoom=11.
+# Basemap: OSM raster tiles drawn faded over white so stations/arcs stand out.
+# Tune BASEMAP_OPACITY (0 = blank, 1 = full-strength OSM). The style `id` lets
+# Plotly see it's the same style each tick instead of reloading it.
+BASEMAP_OPACITY = 0.45
+BASEMAP_STYLE = {
+    "version": 8,
+    "id": "faded-osm",
+    "sources": {
+        "osm": {
+            "type": "raster",
+            "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            "tileSize": 256,
+            "maxzoom": 19,
+            "attribution": "© OpenStreetMap contributors",
+        },
+    },
+    "layers": [
+        {"id": "background", "type": "background",
+         "paint": {"background-color": "#ffffff"}},
+        {"id": "osm", "type": "raster", "source": "osm",
+         "paint": {"raster-opacity": BASEMAP_OPACITY, "raster-saturation": -0.3}},
+    ],
+}
+
+MAP_LAYOUT = {
+    "map": {"style": BASEMAP_STYLE, "center": TORONTO_CENTER, "zoom": 11},
+    "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+    "showlegend": False,
+    "uirevision": "keep-view",
+}
+
+
+def build_base_figure() -> dict:
     sdf = STATIONS_DF
-
-    # Station trace: faint dots so initial load shows station positions.
-    # Once animation starts, the Mapbox GL 'bs-station-layer' overlays these
-    # with flow-colored circles.
-    station_trace = go.Scattermapbox(
-        lat=sdf["lat"].tolist(),
-        lon=sdf["lon"].tolist(),
-        mode="markers",
-        name="Stations",
-        marker=dict(size=4, color="#888888", opacity=0.4),
-        text=sdf["name"].tolist(),
-        hoverinfo="text",
-    )
-
-    fig = go.Figure(data=[station_trace])
-    fig.update_layout(
-        mapbox=dict(style="open-street-map", center=TORONTO_CENTER, zoom=11),
-        margin=dict(l=0, r=0, t=0, b=0),
-        showlegend=False,
-    )
-    return fig
+    return {
+        "data": [{
+            "type": "scattermap",
+            "lat": sdf["lat"].tolist(), "lon": sdf["lon"].tolist(),
+            "mode": "markers",
+            "marker": {"size": 4, "color": "#888888", "opacity": 0.4},
+            "text": sdf["name"].tolist(), "hoverinfo": "text",
+        }],
+        "layout": MAP_LAYOUT,
+    }
 
 
 # ── Clientside animation callback ─────────────────────────────────────────────
-#
-# Architecture: completely bypass Plotly for all animation updates.
-# Instead, use the raw Mapbox GL JS API:
-#   map.addSource() / map.addLayer()  — one-time setup on first tick
-#   map.getSource(id).setData(geojson) — every subsequent tick
-#
-# map.getSource().setData() ONLY updates the GeoJSON data fed to the GPU
-# renderer.  It never touches the camera / viewport, so zoom/pan is
-# permanently preserved no matter how fast the animation runs.
+# Rebuilds the figure in the browser each tick. Arcs are drawn as one line
+# trace per user type, with null separators between segments.
 _ANIMATION_JS = """
-function(current_min, trip_data, station_data) {
-    if (!trip_data || !station_data || current_min === null || current_min === undefined) {
-        return window.dash_clientside.no_update;
+function(current_min, trip_data, station_data, layout) {
+    var nu = window.dash_clientside.no_update;
+    if (!trip_data || !station_data || !layout ||
+        current_min === null || current_min === undefined) {
+        return [nu, nu];
     }
 
-    var graphDiv = document.getElementById('map');
-    if (!graphDiv || !graphDiv._fullLayout) {
-        return window.dash_clientside.no_update;
-    }
-
-    // ── Find the underlying Mapbox GL / MapLibre GL map instance ─────────────
-    // Plotly stores it somewhere inside _fullLayout; we try every known path
-    // plus a broad scan so this works across Plotly versions.
-    function findMap() {
-        var fl = graphDiv._fullLayout;
-        var directPaths = [
-            function(){ return fl.mapbox._subplot.map;     },
-            function(){ return fl.mapbox._subplot._map;    },
-            function(){ return fl.map._subplot.map;        },
-            function(){ return fl.map._subplot._map;       },
-            function(){ return fl.mapbox._subplot.maplibre;},
-        ];
-        for (var i = 0; i < directPaths.length; i++) {
-            try { var m = directPaths[i](); if (m && m.getZoom) return m; } catch(e) {}
-        }
-        // Broad scan: walk all _fullLayout keys looking for an object with getZoom
-        try {
-            var keys = Object.keys(fl);
-            for (var ki = 0; ki < keys.length; ki++) {
-                var obj = fl[keys[ki]];
-                if (!obj || typeof obj !== 'object') continue;
-                var sub = obj._subplot;
-                if (!sub || typeof sub !== 'object') continue;
-                var skeys = Object.keys(sub);
-                for (var si = 0; si < skeys.length; si++) {
-                    var v = sub[skeys[si]];
-                    if (v && typeof v.getZoom === 'function') return v;
-                }
-            }
-        } catch(e) {}
-        return null;
-    }
-
-    var map = findMap();
-    if (!map) return window.dash_clientside.no_update;
-
-    // ── One-time layer setup (keyed to the Mapbox GL instance) ───────────────
-    // When the date changes, Plotly rebuilds the map → new instance, _bsSetup
-    // is absent → we re-add our layers automatically.
-    if (!map._bsSetup) {
-        // Wait until the map style is fully loaded before adding layers
-        if (!map.isStyleLoaded()) {
-            map.once('style.load', function() { map._bsSetup = false; });
-            return window.dash_clientside.no_update;
-        }
-
-        map._bsSetup = true;
-
-        // Clean up stale layers/sources from a previous session (hot-reload etc.)
-        ['bs-casual-layer','bs-member-layer','bs-station-layer'].forEach(function(id){
-            try { if (map.getLayer(id)) map.removeLayer(id); } catch(e) {}
-        });
-        ['bs-casual-arcs','bs-member-arcs','bs-stations'].forEach(function(id){
-            try { if (map.getSource(id)) map.removeSource(id); } catch(e) {}
-        });
-
-        // Station circles — color = net flow, radius = |flow| magnitude
-        map.addSource('bs-stations', {type:'geojson', data:{type:'FeatureCollection',features:[]}});
-        map.addLayer({
-            id: 'bs-station-layer', type: 'circle', source: 'bs-stations',
-            paint: {
-                'circle-color': ['interpolate',['linear'],['get','flow'],
-                    -1,'#e8000b', 0,'#f5d000', 1,'#00c000'],
-                'circle-radius': ['interpolate',['linear'],['get','r'], 0,6, 1,18],
-                'circle-opacity': 0.9,
-                'circle-stroke-width': 1,
-                'circle-stroke-color': 'rgba(0,0,0,0.25)'
-            }
-        });
-
-        // Member trip arcs (blue)
-        map.addSource('bs-member-arcs', {type:'geojson', data:{type:'FeatureCollection',features:[]}});
-        map.addLayer({
-            id: 'bs-member-layer', type: 'line', source: 'bs-member-arcs',
-            paint: {'line-color':'#3399ff','line-width':1,'line-opacity':0.5}
-        });
-
-        // Casual trip arcs (orange)
-        map.addSource('bs-casual-arcs', {type:'geojson', data:{type:'FeatureCollection',features:[]}});
-        map.addLayer({
-            id: 'bs-casual-layer', type: 'line', source: 'bs-casual-arcs',
-            paint: {'line-color':'#ff8833','line-width':1,'line-opacity':0.5}
-        });
-    }
-
-    // ── Compute per-station flow and active arcs ──────────────────────────────
     var sm=trip_data.sm, em=trip_data.em;
     var slat=trip_data.slat, slon=trip_data.slon;
     var elat=trip_data.elat, elon=trip_data.elon;
@@ -208,51 +133,70 @@ function(current_min, trip_data, station_data) {
     var ns=stLat.length;
 
     var dep=new Float32Array(ns), arr=new Float32Array(ns);
-    var mFeatures=[], cFeatures=[];
+    var mLat=[], mLon=[], cLat=[], cLon=[];
     var mCount=0, cCount=0;
 
     for (var i=0; i<n; i++) {
         var s=sm[i], e=em[i];
-        if (s<=current_min) { var di=sidIdx[String(ssid[i])]; if(di!==undefined) dep[di]++; }
-        if (e<=current_min) { var ai=sidIdx[String(esid[i])]; if(ai!==undefined) arr[ai]++; }
+        if (s<=current_min){var di=sidIdx[String(ssid[i])];if(di!==undefined)dep[di]++;}
+        if (e<=current_min){var ai=sidIdx[String(esid[i])];if(ai!==undefined)arr[ai]++;}
         if (s<=current_min && e>=current_min) {
-            var feat={type:'Feature',
-                geometry:{type:'LineString',
-                    coordinates:[[slon[i],slat[i]],[elon[i],elat[i]]]}};
-            if (um[i]===0) { mFeatures.push(feat); mCount++; }
-            else            { cFeatures.push(feat); cCount++; }
+            if (um[i]===0){mLat.push(slat[i],elat[i],null);mLon.push(slon[i],elon[i],null);mCount++;}
+            else          {cLat.push(slat[i],elat[i],null);cLon.push(slon[i],elon[i],null);cCount++;}
         }
     }
 
-    var maxAbs=1, netFlow=new Float32Array(ns);
+    var netFlow=new Float32Array(ns), maxAbs=1;
     for (var j=0; j<ns; j++) {
         netFlow[j]=arr[j]-dep[j];
         if (Math.abs(netFlow[j])>maxAbs) maxAbs=Math.abs(netFlow[j]);
     }
 
-    // ── Build GeoJSON for stations ────────────────────────────────────────────
-    var stFeatures=[];
+    var color=new Array(ns), size=new Array(ns), text=new Array(ns);
     for (var k=0; k<ns; k++) {
-        var nf=netFlow[k]/maxAbs;                  // -1 … 1  (colour)
-        var r=Math.abs(nf);                         //  0 … 1  (radius)
-        stFeatures.push({type:'Feature',
-            geometry:{type:'Point',coordinates:[stLon[k],stLat[k]]},
-            properties:{name:stName[k], flow:nf, r:r, net:Math.round(netFlow[k])}
+        var nf=netFlow[k]/maxAbs;
+        color[k]=nf;
+        size[k]=6+12*Math.abs(nf);
+        text[k]=stName[k]+'<br>net: '+Math.round(netFlow[k]);
+    }
+
+    var hh=String(Math.floor(current_min/60)).padStart(2,'0');
+    var mm=String(current_min%60).padStart(2,'0');
+    var timeText=hh+':'+mm+'  |  Active:'+(mCount+cCount)
+                 +' (M:'+mCount+' C:'+cCount+')';
+
+    // Carry over the live camera so Plotly.react never moves the viewport.
+    var viewLayout = Object.assign({}, layout);
+    var gd = document.querySelector('#map .js-plotly-plot');
+    var sub = gd && gd._fullLayout && gd._fullLayout.map && gd._fullLayout.map._subplot;
+    if (sub && sub.map) {
+        // Mid-gesture (wheel zoom easing, drag inertia): skip this redraw so
+        // Plotly.react doesn't cut the camera animation short.
+        if (sub.map.isMoving()) return [nu, timeText];
+        var c = sub.map.getCenter();
+        viewLayout.map = Object.assign({}, layout.map, {
+            center: {lat: c.lat, lon: c.lng},
+            zoom: sub.map.getZoom(),
+            bearing: sub.map.getBearing(),
+            pitch: sub.map.getPitch()
         });
     }
 
-    // ── Push new data to Mapbox GL — NO Plotly calls, viewport untouched ──────
-    map.getSource('bs-stations').setData(
-        {type:'FeatureCollection', features:stFeatures});
-    map.getSource('bs-member-arcs').setData(
-        {type:'FeatureCollection', features:mFeatures});
-    map.getSource('bs-casual-arcs').setData(
-        {type:'FeatureCollection', features:cFeatures});
+    var figure = {
+        data: [
+            {type:'scattermap', mode:'lines', lat:mLat, lon:mLon,
+             line:{color:'rgba(51,153,255,0.5)', width:1}, hoverinfo:'skip'},
+            {type:'scattermap', mode:'lines', lat:cLat, lon:cLon,
+             line:{color:'rgba(255,136,51,0.5)', width:1}, hoverinfo:'skip'},
+            {type:'scattermap', mode:'markers', lat:stLat, lon:stLon,
+             marker:{color:color, size:size, cmin:-1, cmax:1, opacity:0.9,
+                     colorscale:[[0,'#e8000b'],[0.5,'#f5d000'],[1,'#00c000']]},
+             text:text, hoverinfo:'text'}
+        ],
+        layout: viewLayout
+    };
 
-    var hh=String(Math.floor(current_min/60)).padStart(2,'0');
-    var mm2=String(current_min%60).padStart(2,'0');
-    return hh+':'+mm2+'  |  Active: '+(mCount+cCount)
-           +'  (M:'+mCount+' C:'+cCount+')';
+    return [figure, timeText];
 }
 """
 
@@ -263,29 +207,30 @@ app = Dash(__name__, title="Bike Share Toronto")
 app.layout = html.Div(
     [
         dcc.Store(id="loaded-date", data=None),
-        dcc.Store(id="trip-store", data=None),
+        dcc.Store(id="trip-store",  data=None),
         dcc.Store(id="station-store", data=_STATION_STORE),
+        dcc.Store(id="map-layout", data=MAP_LAYOUT),
         dcc.Interval(id="interval", interval=500, disabled=True, n_intervals=0),
 
         # Header
         html.Div(
             [
                 html.Span("Bike Share Toronto",
-                          style={"fontWeight": "bold", "fontSize": "18px", "color": "white"}),
-                html.Span("Date:", style={"color": "#ccc", "marginLeft": "24px"}),
+                          style={"fontWeight":"bold","fontSize":"18px","color":"white"}),
+                html.Span("Date:", style={"color":"#ccc","marginLeft":"24px"}),
                 dcc.DatePickerSingle(
                     id="date-picker",
                     min_date_allowed=MIN_DATE, max_date_allowed=MAX_DATE,
                     date=DEFAULT_DATE, display_format="YYYY-MM-DD",
                 ),
                 html.Div(id="total-trips",
-                         style={"color": "#aaffaa", "marginLeft": "24px", "fontSize": "14px"}),
+                         style={"color":"#aaffaa","marginLeft":"24px","fontSize":"14px"}),
                 html.Div(id="time-display", children="00:00",
-                         style={"color": "#ffff88", "marginLeft": "32px",
-                                "fontSize": "15px", "fontWeight": "bold"}),
+                         style={"color":"#ffff88","marginLeft":"32px",
+                                "fontSize":"15px","fontWeight":"bold"}),
             ],
-            style={"display": "flex", "alignItems": "center", "gap": "8px",
-                   "padding": "10px 16px", "background": "#1a1a2e"},
+            style={"display":"flex","alignItems":"center","gap":"8px",
+                   "padding":"10px 16px","background":"#1a1a2e"},
         ),
 
         # Map container with legend overlay
@@ -294,43 +239,38 @@ app.layout = html.Div(
                 dcc.Graph(
                     id="map",
                     figure=build_base_figure(),
-                    style={"height": "67vh"},
-                    config={"scrollZoom": True},
+                    style={"height":"67vh"},
+                    config={"scrollZoom": True, "displayModeBar": False},
                 ),
-                # Colour-coded legend (HTML overlay — no Plotly colorbar needed)
+                # Legend overlay
                 html.Div(
                     [
-                        html.Div("Station flow", style={"fontWeight": "bold",
-                                                        "marginBottom": "4px",
-                                                        "fontSize": "12px"}),
+                        html.Div("Station flow",
+                                 style={"fontWeight":"bold","marginBottom":"4px",
+                                        "fontSize":"12px"}),
                         html.Div([
                             html.Span("▲ bikes in  ",
-                                      style={"color": "#00c000", "fontSize": "12px"}),
+                                      style={"color":"#00c000","fontSize":"12px"}),
                             html.Span("● neutral  ",
-                                      style={"color": "#f5d000", "fontSize": "12px"}),
+                                      style={"color":"#aa8800","fontSize":"12px"}),
                             html.Span("▼ bikes out",
-                                      style={"color": "#e8000b", "fontSize": "12px"}),
+                                      style={"color":"#e8000b","fontSize":"12px"}),
                         ]),
-                        html.Hr(style={"margin": "4px 0", "borderColor": "#ccc"}),
-                        html.Div([
-                            html.Span("— Member",
-                                      style={"color": "#3399ff", "fontSize": "12px"}),
-                        ]),
-                        html.Div([
-                            html.Span("— Casual",
-                                      style={"color": "#ff8833", "fontSize": "12px"}),
-                        ]),
+                        html.Hr(style={"margin":"4px 0","borderColor":"#ccc"}),
+                        html.Div(html.Span("— Member",
+                                 style={"color":"#3399ff","fontSize":"12px"})),
+                        html.Div(html.Span("— Casual",
+                                 style={"color":"#ff8833","fontSize":"12px"})),
                     ],
                     style={
-                        "position": "absolute", "top": "10px", "right": "10px",
-                        "background": "rgba(255,255,255,0.88)",
-                        "border": "1px solid #ccc", "borderRadius": "4px",
-                        "padding": "8px 10px", "pointerEvents": "none",
-                        "zIndex": 1000,
+                        "position":"absolute","top":"10px","right":"10px",
+                        "background":"rgba(255,255,255,0.88)",
+                        "border":"1px solid #ccc","borderRadius":"4px",
+                        "padding":"8px 10px","pointerEvents":"none","zIndex":1000,
                     },
                 ),
             ],
-            style={"position": "relative"},
+            style={"position":"relative"},
         ),
 
         # Controls
@@ -339,37 +279,37 @@ app.layout = html.Div(
                 html.Div(
                     [
                         html.Button("▶ Play", id="play-btn", n_clicks=0,
-                                    style={"padding": "7px 18px", "fontWeight": "bold",
-                                           "cursor": "pointer", "border": "1px solid #999",
-                                           "borderRadius": "4px", "background": "#fff",
-                                           "fontSize": "14px"}),
-                        html.Span("Speed:", style={"marginLeft": "16px", "marginRight": "6px"}),
+                                    style={"padding":"7px 18px","fontWeight":"bold",
+                                           "cursor":"pointer","border":"1px solid #999",
+                                           "borderRadius":"4px","background":"#fff",
+                                           "fontSize":"14px"}),
+                        html.Span("Speed:", style={"marginLeft":"16px","marginRight":"6px"}),
                         dcc.Dropdown(
                             id="speed-select",
                             options=[
-                                {"label": "1×  (very slow)", "value": 1},
-                                {"label": "5×  (slow)",      "value": 5},
-                                {"label": "10× (default)",   "value": 10},
-                                {"label": "30× (fast)",      "value": 30},
-                                {"label": "60× (very fast)", "value": 60},
+                                {"label":"1×  (very slow)","value":1},
+                                {"label":"5×  (slow)",     "value":5},
+                                {"label":"10× (default)",  "value":10},
+                                {"label":"30× (fast)",     "value":30},
+                                {"label":"60× (very fast)","value":60},
                             ],
                             value=10, clearable=False,
-                            style={"width": "155px", "display": "inline-block"},
+                            style={"width":"155px","display":"inline-block"},
                         ),
                     ],
-                    style={"display": "flex", "alignItems": "center", "marginBottom": "8px"},
+                    style={"display":"flex","alignItems":"center","marginBottom":"8px"},
                 ),
                 dcc.Slider(
                     id="time-slider", min=0, max=1439, step=1, value=0,
-                    marks={i * 60: f"{i:02d}:00" for i in range(0, 25, 2)},
-                    tooltip={"placement": "bottom", "always_visible": False},
+                    marks={i*60: f"{i:02d}:00" for i in range(0, 25, 2)},
+                    tooltip={"placement":"bottom","always_visible":False},
                 ),
             ],
-            style={"padding": "10px 20px", "background": "#f4f4f4",
-                   "borderTop": "1px solid #ddd"},
+            style={"padding":"10px 20px","background":"#f4f4f4",
+                   "borderTop":"1px solid #ddd"},
         ),
     ],
-    style={"fontFamily": "sans-serif"},
+    style={"fontFamily":"sans-serif"},
 )
 
 
@@ -386,17 +326,6 @@ def on_date_change(date_str):
         return no_update, no_update, no_update
     df = get_day_df(date_str)
     return date_str, f"{len(df):,} trips on {date_str}", serialize_trips(df)
-
-
-@app.callback(
-    Output("map", "figure"),
-    Input("loaded-date", "data"),
-)
-def on_date_figure(date_str):
-    if not date_str:
-        return build_base_figure()
-    get_day_df(date_str)
-    return build_base_figure()
 
 
 @app.callback(
@@ -422,13 +351,15 @@ def advance_time(_, current_min, speed):
     return (current_min + speed) % 1440
 
 
-# ── Clientside callback — pure Mapbox GL, zero Plotly calls during animation ──
+# ── Clientside: animation — rebuilds the figure; uirevision keeps the view ────
 app.clientside_callback(
     _ANIMATION_JS,
+    Output("map", "figure"),
     Output("time-display", "children"),
     Input("time-slider", "value"),
-    State("trip-store", "data"),
+    Input("trip-store", "data"),
     State("station-store", "data"),
+    State("map-layout", "data"),
     prevent_initial_call=True,
 )
 
