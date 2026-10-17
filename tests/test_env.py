@@ -1,0 +1,144 @@
+"""Unit tests on tiny synthetic worlds (no disk data needed)."""
+import numpy as np
+import pandas as pd
+import pytest
+from gymnasium.utils.env_checker import check_env
+
+from bikeshare_env.env import BikeShareEnv
+from bikeshare_env.trips import TripEvents
+
+# 4 stations on a line: road distance = 1 km per index gap, 2 min per km.
+POS = np.arange(4)
+DIST = np.abs(POS[:, None] - POS[None, :]).astype(float)
+TIME = 2 * DIST
+
+
+def make_env(capacity=(10, 10, 10, 10), trips=(), occupancy=0.5, **kw):
+    stations = pd.DataFrame({
+        "station_id": [100, 101, 102, 103],
+        "lat": [43.65, 43.66, 43.67, 43.68], "lon": [-79.38] * 4,
+        "capacity": list(capacity),
+    })
+    cols = ["start_min", "end_min", "start_idx", "end_idx", "rent_min"]
+    events = TripEvents.from_frame(pd.DataFrame(list(trips), columns=cols))
+    kw.setdefault("depot_station", 100)
+    env = BikeShareEnv(init_occupancy=occupancy, simulation_period=("2026-06-15", "2026-06-16"),
+                       stations=stations, trips=events,
+                       road_dist_km=DIST, road_time_min=TIME, **kw)
+    env.reset(seed=0)
+    return env
+
+
+def noop(env):
+    return np.zeros((env.n_trucks, 3), dtype=np.int64)
+
+
+def run(env, minutes, action_at=None):
+    """Step `minutes` times; action_at maps minute -> action. Returns rewards."""
+    rewards = []
+    for m in range(minutes):
+        a = (action_at or {}).get(m, noop(env))
+        _, r, *_ = env.step(a)
+        rewards.append(r)
+    return np.array(rewards)
+
+
+def test_init_occupancy_rounds_up():
+    env = make_env(capacity=(10, 5, 3, 1), occupancy=0.5)
+    assert env.bikes.tolist() == [5, 3, 2, 1]
+    assert make_env(occupancy=0.0).bikes.sum() == 0
+
+
+def test_rent_and_return_rewards():
+    env = make_env(trips=[(0, 5, 0, 1, 5)])
+    r = run(env, 6)
+    assert r[0] == pytest.approx(1.0)             # unlock fee at rental
+    assert r[5] == pytest.approx(0.15 * 5)        # per-minute fee at return
+    assert r[1:5].sum() == 0
+    assert env.bikes.tolist() == [4, 6, 5, 5]
+
+
+def test_lost_trip_penalty_when_station_empty():
+    env = make_env(trips=[(0, 5, 0, 1, 5)], occupancy=0.0)
+    _, r, _, _, info = env.step(noop(env))
+    assert r == pytest.approx(-0.5)
+    assert info["lost_trips"] == 1
+    assert run(env, 10).sum() == 0                # no return for a lost trip
+
+
+def test_full_station_overflow_goes_to_nearest_free_after_delay():
+    # Station 1 is full; station 0 frees a dock when the trip starts.
+    env = make_env(capacity=(2, 1, 1, 5), trips=[(0, 3, 0, 1, 3)], occupancy=1.0)
+    r = run(env, 25)
+    assert r[3] == 0                              # no reward at the failed return
+    assert r[3 + 15] == pytest.approx(0.10 * 3)   # 15-min delay not billed
+    assert r.sum() == pytest.approx(1.0 + 0.3)
+    assert env.bikes.tolist() == [2, 1, 1, 5]     # placed back at station 0
+    assert env.totals["overflow_returns"] == 1
+
+
+def test_truck_mission_timing_costs_and_non_cancelable():
+    # Depot = station 0 (empty dock space). Pick 3 at station 1, drop at 3.
+    env = make_env(n_trucks=1, shift=(9, 17))
+    action = np.array([[1 + 1, 3, 3]])
+    _, r0, _, _, info = env.step(action)
+    assert not info["idle_trucks"][0]
+    assert info["fixed_cost"] == 100
+    assert info["labor_cost"] == pytest.approx(160 + 40 / 60)   # shift + 1 busy night min
+
+    # A new order for the busy truck is ignored.
+    env.step(np.array([[0 + 1, 2, 5]]))
+    tk = env.trucks[0]
+    assert [op for op in tk.ops] == [("load", 1), ("drive", 3), ("unload", 3)]
+
+    run(env, 20)
+    # drive 0->1: 2 min, load 3: 3 min, drive 1->3: 4 min, unload 3: 3 min = 12 busy min
+    assert env.bikes.tolist() == [5, 2, 5, 8]
+    assert env.trucks[0].location == 3 and env.trucks[0].load == 0
+    assert env.totals["fuel_cost"] == pytest.approx(0.3 * (1 + 2))
+    assert env.totals["labor_cost"] == pytest.approx(160 + 12 * 40 / 60)
+    assert env.totals["bikes_moved"] == 3
+
+
+def test_load_limited_by_bikes_and_leftover_dropped_at_nearest_free():
+    # Station 1 has 4 bikes; station 2 has 1 free dock -> 3 leftover go to the
+    # nearest free station from 2 (stations 1 and 3 tie at 1 km; lower index wins).
+    env = make_env(capacity=(10, 8, 6, 10), n_trucks=1)
+    env.bikes[:] = [0, 4, 5, 0]
+    env.step(np.array([[1 + 1, 2, 10]]))
+    run(env, 40)
+    assert env.bikes.tolist() == [0, 3, 6, 0]
+    assert env.trucks[0].location == 1
+    assert env.totals["truck_km"] == pytest.approx(1 + 1 + 1)
+
+
+def test_fixed_and_shift_cost_once_per_truck_per_day():
+    env = make_env(n_trucks=1)
+    go = np.array([[1 + 1, 2, 1]])
+    env.step(go)
+    run(env, 30)
+    env.step(np.array([[2 + 1, 1, 1]]))           # second mission same day
+    run(env, 30)
+    assert env.totals["fixed_cost"] == 100
+    env.t = 1440                                  # jump to day 2
+    env.step(go)
+    assert env.totals["fixed_cost"] == 200
+
+
+def test_truck_missions_to_blocked_stations_are_noops():
+    env = make_env(n_trucks=1, truck_blocked_stations=(103,))
+    _, _, _, _, info = env.step(np.array([[1 + 1, 3, 2]]))
+    assert info["idle_trucks"][0] and info["fixed_cost"] == 0
+
+
+def test_episode_length_and_termination():
+    env = make_env()
+    done, steps = False, 0
+    while not done:
+        *_, done, _, _ = env.step(noop(env))
+        steps += 1
+    assert steps == 2 * 1440
+
+
+def test_gymnasium_env_checker():
+    check_env(make_env(trips=[(0, 5, 0, 1, 5)]), skip_render_check=True)
