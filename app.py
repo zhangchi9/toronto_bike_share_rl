@@ -23,6 +23,7 @@ _STATION_STORE = {
     "lat": STATIONS_DF["lat"].tolist(),
     "lon": STATIONS_DF["lon"].tolist(),
     "name": STATIONS_DF["name"].tolist(),
+    "cap":  STATIONS_DF["capacity"].tolist(),
     "sid": STATIONS_DF["station_id"].tolist(),
     "idx": {str(int(sid)): i for i, sid in enumerate(STATIONS_DF["station_id"])},
 }
@@ -105,7 +106,9 @@ def build_base_figure() -> dict:
             "lat": sdf["lat"].tolist(), "lon": sdf["lon"].tolist(),
             "mode": "markers",
             "marker": {"size": 4, "color": "#888888", "opacity": 0.4},
-            "text": sdf["name"].tolist(), "hoverinfo": "text",
+            "text": (sdf["name"] + "<br>capacity: "
+                     + sdf["capacity"].astype(str) + " docks").tolist(),
+            "hoverinfo": "text",
         }],
         "layout": MAP_LAYOUT,
     }
@@ -129,7 +132,7 @@ function(current_min, trip_data, station_data, layout) {
     var n=sm.length;
 
     var stLat=station_data.lat, stLon=station_data.lon;
-    var stName=station_data.name, sidIdx=station_data.idx;
+    var stName=station_data.name, stCap=station_data.cap, sidIdx=station_data.idx;
     var ns=stLat.length;
 
     var dep=new Float32Array(ns), arr=new Float32Array(ns);
@@ -157,7 +160,8 @@ function(current_min, trip_data, station_data, layout) {
         var nf=netFlow[k]/maxAbs;
         color[k]=nf;
         size[k]=6+12*Math.abs(nf);
-        text[k]=stName[k]+'<br>net: '+Math.round(netFlow[k]);
+        text[k]=stName[k]+'<br>capacity: '+stCap[k]+' docks'
+                +'<br>net: '+Math.round(netFlow[k]);
     }
 
     var hh=String(Math.floor(current_min/60)).padStart(2,'0');
