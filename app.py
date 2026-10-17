@@ -1,62 +1,62 @@
 """
-Bike Share Toronto — Animated Daily Trip Viewer
+Bike Share Toronto — simulated day viewer
+Runs the BikeShareToronto-v0 env for the chosen date + rebalancing policy, then
+animates the recorded day: station fill levels, active rides and live metrics.
 Usage:
-    python fetch_stations.py     # once
-    python preprocess.py         # once
-    python app.py                # http://localhost:8050
+    python fetch_stations.py         # once
+    python preprocess.py             # once
+    python build_road_distances.py   # once
+    python app.py                    # http://localhost:8050
 """
-import pandas as pd
+import base64
+from functools import lru_cache
+
 from dash import Dash, dcc, html, Input, Output, State, no_update
 
-from data_loader import load_stations, load_day
+from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY
+from bikeshare_env.policies import POLICIES
+from bikeshare_env.rollout import simulate_day
+from data_loader import load_stations
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 STATIONS_DF = load_stations()
-_day_cache: dict[str, pd.DataFrame] = {}
 
 TORONTO_CENTER = {"lat": 43.655, "lon": -79.38}
 MIN_DATE = "2026-01-01"
 MAX_DATE = "2026-09-30"
 DEFAULT_DATE = "2026-06-15"
+DEFAULT_POLICY = "no_rebalancing"
+INIT_OCCUPANCY = DEFAULT_INIT_OCCUPANCY
 
 _STATION_STORE = {
     "lat": STATIONS_DF["lat"].tolist(),
     "lon": STATIONS_DF["lon"].tolist(),
     "name": STATIONS_DF["name"].tolist(),
     "cap":  STATIONS_DF["capacity"].tolist(),
-    "sid": STATIONS_DF["station_id"].tolist(),
-    "idx": {str(int(sid)): i for i, sid in enumerate(STATIONS_DF["station_id"])},
 }
 
 
-def get_day_df(date_str: str) -> pd.DataFrame:
-    if date_str not in _day_cache:
-        df = load_day(date_str, STATIONS_DF)
-        df = df.dropna(subset=["Start_Time", "End_Time",
-                                "start_lat", "start_lon", "end_lat", "end_lon"])
-        day_start = pd.Timestamp(date_str)
-        df["start_min"] = (
-            (df["Start_Time"] - day_start).dt.total_seconds() / 60
-        ).clip(0, 1439).astype(int)
-        df["end_min"] = (
-            (df["End_Time"] - day_start).dt.total_seconds() / 60
-        ).clip(0, 1439).astype(int)
-        _day_cache.clear()
-        _day_cache[date_str] = df
-    return _day_cache[date_str]
-
-
-def serialize_trips(df: pd.DataFrame) -> dict:
+@lru_cache(maxsize=4)
+def get_simulation(date_str: str, policy: str) -> dict:
+    """Simulate one day and serialize it for the browser (~3 MB)."""
+    r = simulate_day(date_str, policy, init_occupancy=INIT_OCCUPANCY)
+    t = r.trips
     return {
-        "sm":   df["start_min"].tolist(),
-        "em":   df["end_min"].tolist(),
-        "slat": df["start_lat"].round(5).tolist(),
-        "slon": df["start_lon"].round(5).tolist(),
-        "elat": df["end_lat"].round(5).tolist(),
-        "elon": df["end_lon"].round(5).tolist(),
-        "um":   (df["User_Type"] == "Casual").astype(int).tolist(),
-        "ssid": df["Start_Station_Id"].tolist(),
-        "esid": df["End_Station_Id"].tolist(),
+        "key": f"{date_str}|{policy}",
+        # (1440 x N) uint8 bike counts, row-major, base64 to keep JSON small
+        "bikes": base64.b64encode(r.bikes.tobytes()).decode("ascii"),
+        "reward": r.reward.round(2).tolist(),
+        "fulfilled": r.fulfilled.tolist(),
+        "lost": r.lost.tolist(),
+        "active": r.active.tolist(),
+        "blocked": r.blocked.tolist(),
+        "pending": r.pending.tolist(),
+        "trips": {
+            "sm": t.start_min.tolist(), "em": t.end_min.tolist(),
+            "s": t.start_idx.tolist(), "e": t.end_idx.tolist(),
+            "casual": t.casual.tolist(), "ok": r.trip_started.astype(int).tolist(),
+        },
+        "n_requests": len(t),
     }
 
 
@@ -115,59 +115,73 @@ def build_base_figure() -> dict:
 
 
 # ── Clientside animation callback ─────────────────────────────────────────────
-# Rebuilds the figure in the browser each tick. Arcs are drawn as one line
-# trace per user type, with null separators between segments.
+# Rebuilds the figure in the browser each tick from the recorded simulation:
+# station colour = fill level (bikes / docks), arcs = rides in progress (only
+# requests the simulation actually served), plus the metric cards.
 _ANIMATION_JS = """
-function(current_min, trip_data, station_data, layout) {
+function(current_min, sim, station_data, layout) {
     var nu = window.dash_clientside.no_update;
-    if (!trip_data || !station_data || !layout ||
+    if (!sim || !station_data || !layout ||
         current_min === null || current_min === undefined) {
-        return [nu, nu];
+        return Array(__N_OUTPUTS__).fill(nu);
     }
+    var t = Math.max(0, Math.min(1439, current_min));
 
-    var sm=trip_data.sm, em=trip_data.em;
-    var slat=trip_data.slat, slon=trip_data.slon;
-    var elat=trip_data.elat, elon=trip_data.elon;
-    var um=trip_data.um, ssid=trip_data.ssid, esid=trip_data.esid;
-    var n=sm.length;
+    // Decode the (1440 x N) bike matrix and cumulative sums once per simulation.
+    if (!window._bsSim || window._bsSim.key !== sim.key) {
+        var bin = atob(sim.bikes), u8 = new Uint8Array(bin.length);
+        for (var b=0; b<bin.length; b++) u8[b] = bin.charCodeAt(b);
+        var cum = {reward:[], fulfilled:[], lost:[], blocked:[]},
+            acc = {reward:0, fulfilled:0, lost:0, blocked:0};
+        for (var m=0; m<sim.reward.length; m++) {
+            for (var key in acc) { acc[key] += sim[key][m]; cum[key].push(acc[key]); }
+        }
+        window._bsSim = {key: sim.key, bikes: u8, cum: cum};
+    }
+    var S = window._bsSim;
 
     var stLat=station_data.lat, stLon=station_data.lon;
-    var stName=station_data.name, stCap=station_data.cap, sidIdx=station_data.idx;
-    var ns=stLat.length;
-
-    var dep=new Float32Array(ns), arr=new Float32Array(ns);
-    var mLat=[], mLon=[], cLat=[], cLon=[];
-    var mCount=0, cCount=0;
-
-    for (var i=0; i<n; i++) {
-        var s=sm[i], e=em[i];
-        if (s<=current_min){var di=sidIdx[String(ssid[i])];if(di!==undefined)dep[di]++;}
-        if (e<=current_min){var ai=sidIdx[String(esid[i])];if(ai!==undefined)arr[ai]++;}
-        if (s<=current_min && e>=current_min) {
-            if (um[i]===0){mLat.push(slat[i],elat[i],null);mLon.push(slon[i],elon[i],null);mCount++;}
-            else          {cLat.push(slat[i],elat[i],null);cLon.push(slon[i],elon[i],null);cCount++;}
-        }
-    }
-
-    var netFlow=new Float32Array(ns), maxAbs=1;
-    for (var j=0; j<ns; j++) {
-        netFlow[j]=arr[j]-dep[j];
-        if (Math.abs(netFlow[j])>maxAbs) maxAbs=Math.abs(netFlow[j]);
-    }
+    var stName=station_data.name, stCap=station_data.cap;
+    var ns=stLat.length, row=t*ns;
 
     var color=new Array(ns), size=new Array(ns), text=new Array(ns);
     for (var k=0; k<ns; k++) {
-        var nf=netFlow[k]/maxAbs;
-        color[k]=nf;
-        size[k]=6+12*Math.abs(nf);
-        text[k]=stName[k]+'<br>capacity: '+stCap[k]+' docks'
-                +'<br>net: '+Math.round(netFlow[k]);
+        var nb=S.bikes[row+k], cap=stCap[k] || 1;
+        color[k]=nb/cap;
+        size[k]=5+10*Math.sqrt(cap/90);
+        text[k]=stName[k]+'<br>bikes: '+nb+' / '+stCap[k]+' docks';
     }
 
-    var hh=String(Math.floor(current_min/60)).padStart(2,'0');
-    var mm=String(current_min%60).padStart(2,'0');
-    var timeText=hh+':'+mm+'  |  Active:'+(mCount+cCount)
-                 +' (M:'+mCount+' C:'+cCount+')';
+    var tr=sim.trips, n=tr.sm.length;
+    var mLat=[], mLon=[], cLat=[], cLon=[];
+    for (var i=0; i<n; i++) {
+        if (!tr.ok[i] || tr.sm[i] > t || tr.em[i] <= t) continue;
+        var s=tr.s[i], e=tr.e[i];
+        if (tr.casual[i]) {cLat.push(stLat[s],stLat[e],null); cLon.push(stLon[s],stLon[e],null);}
+        else              {mLat.push(stLat[s],stLat[e],null); mLon.push(stLon[s],stLon[e],null);}
+    }
+
+    var hh=String(Math.floor(t/60)).padStart(2,'0');
+    var mm=String(t%60).padStart(2,'0');
+    var timeText=hh+':'+mm;
+
+    function money(x) {
+        return (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US',
+            {minimumFractionDigits:2, maximumFractionDigits:2});
+    }
+    var requests = S.cum.fulfilled[t] + S.cum.lost[t];
+    var pct = requests ? ' (' + (100*S.cum.fulfilled[t]/requests).toFixed(1) + '%)' : '';
+    var metrics = [
+        money(sim.reward[t]),
+        money(S.cum.reward[t]),
+        sim.fulfilled[t] + ' of ' + (sim.fulfilled[t] + sim.lost[t]),
+        S.cum.fulfilled[t].toLocaleString() + pct,
+        S.cum.lost[t].toLocaleString(),
+        sim.active[t].toLocaleString(),
+        sim.blocked[t].toLocaleString(),
+        S.cum.blocked[t].toLocaleString(),
+        sim.pending[t].toLocaleString()
+    ];
 
     // Carry over the live camera so Plotly.react never moves the viewport.
     var viewLayout = Object.assign({}, layout);
@@ -176,7 +190,7 @@ function(current_min, trip_data, station_data, layout) {
     if (sub && sub.map) {
         // Mid-gesture (wheel zoom easing, drag inertia): skip this redraw so
         // Plotly.react doesn't cut the camera animation short.
-        if (sub.map.isMoving()) return [nu, timeText];
+        if (sub.map.isMoving()) return [nu, timeText].concat(metrics);
         var c = sub.map.getCenter();
         viewLayout.map = Object.assign({}, layout.map, {
             center: {lat: c.lat, lon: c.lng},
@@ -193,16 +207,43 @@ function(current_min, trip_data, station_data, layout) {
             {type:'scattermap', mode:'lines', lat:cLat, lon:cLon,
              line:{color:'rgba(255,136,51,0.5)', width:1}, hoverinfo:'skip'},
             {type:'scattermap', mode:'markers', lat:stLat, lon:stLon,
-             marker:{color:color, size:size, cmin:-1, cmax:1, opacity:0.9,
-                     colorscale:[[0,'#e8000b'],[0.5,'#f5d000'],[1,'#00c000']]},
+             marker:{color:color, size:size, cmin:0, cmax:1, opacity:0.9,
+                     colorscale:[[0,'#e8000b'],[0.15,'#ff9900'],[0.5,'#2ca02c'],[1,'#1f4fd1']]},
              text:text, hoverinfo:'text'}
         ],
         layout: viewLayout
     };
 
-    return [figure, timeText];
+    return [figure, timeText].concat(metrics);
 }
 """
+
+# Metric cards under the map: (element id, label). Values come from the
+# animation callback, for the minute shown on the slider.
+METRICS = [
+    ("m-reward", "Reward this minute"),
+    ("m-cum-reward", "Cumulative reward"),
+    ("m-fulfilled", "Requests fulfilled this minute"),
+    ("m-cum-fulfilled", "Total requests fulfilled"),
+    ("m-cum-lost", "Total requests lost"),
+    ("m-active", "Active trips"),
+    ("m-blocked", "Returns blocked this minute (station full)"),
+    ("m-cum-blocked", "Total returns blocked"),
+    ("m-pending", "Bikes pending (held 15 min)"),
+]
+
+
+def metric_card(card_id: str, label: str) -> html.Div:
+    return html.Div(
+        [
+            html.Div(label, style={"fontSize":"12px","color":"#666"}),
+            html.Div("–", id=card_id,
+                     style={"fontSize":"20px","fontWeight":"bold","color":"#1a1a2e",
+                            "fontVariantNumeric":"tabular-nums"}),
+        ],
+        style={"flex":"1 1 140px","background":"#fff","border":"1px solid #ddd",
+               "borderRadius":"6px","padding":"8px 12px"},
+    )
 
 
 # ── App layout ────────────────────────────────────────────────────────────────
@@ -210,8 +251,7 @@ app = Dash(__name__, title="Bike Share Toronto")
 
 app.layout = html.Div(
     [
-        dcc.Store(id="loaded-date", data=None),
-        dcc.Store(id="trip-store",  data=None),
+        dcc.Store(id="sim-store", data=None),
         dcc.Store(id="station-store", data=_STATION_STORE),
         dcc.Store(id="map-layout", data=MAP_LAYOUT),
         dcc.Interval(id="interval", interval=500, disabled=True, n_intervals=0),
@@ -227,8 +267,19 @@ app.layout = html.Div(
                     min_date_allowed=MIN_DATE, max_date_allowed=MAX_DATE,
                     date=DEFAULT_DATE, display_format="YYYY-MM-DD",
                 ),
-                html.Div(id="total-trips",
-                         style={"color":"#aaffaa","marginLeft":"24px","fontSize":"14px"}),
+                html.Span("Policy:", style={"color":"#ccc","marginLeft":"16px"}),
+                dcc.Dropdown(
+                    id="policy-select",
+                    options=[{"label": cls.label, "value": key}
+                             for key, cls in POLICIES.items()],
+                    value=DEFAULT_POLICY, clearable=False,
+                    style={"width":"230px"},
+                ),
+                dcc.Loading(
+                    html.Div(id="total-trips",
+                             style={"color":"#aaffaa","marginLeft":"24px","fontSize":"14px"}),
+                    type="dot", color="#aaffaa",
+                ),
                 html.Div(id="time-display", children="00:00",
                          style={"color":"#ffff88","marginLeft":"32px",
                                 "fontSize":"15px","fontWeight":"bold"}),
@@ -243,22 +294,22 @@ app.layout = html.Div(
                 dcc.Graph(
                     id="map",
                     figure=build_base_figure(),
-                    style={"height":"67vh"},
+                    style={"height":"60vh"},
                     config={"scrollZoom": True, "displayModeBar": False},
                 ),
                 # Legend overlay
                 html.Div(
                     [
-                        html.Div("Station flow",
+                        html.Div("Station fill (bikes / docks)",
                                  style={"fontWeight":"bold","marginBottom":"4px",
                                         "fontSize":"12px"}),
                         html.Div([
-                            html.Span("▲ bikes in  ",
-                                      style={"color":"#00c000","fontSize":"12px"}),
-                            html.Span("● neutral  ",
-                                      style={"color":"#aa8800","fontSize":"12px"}),
-                            html.Span("▼ bikes out",
+                            html.Span("● empty  ",
                                       style={"color":"#e8000b","fontSize":"12px"}),
+                            html.Span("● half  ",
+                                      style={"color":"#2ca02c","fontSize":"12px"}),
+                            html.Span("● full",
+                                      style={"color":"#1f4fd1","fontSize":"12px"}),
                         ]),
                         html.Hr(style={"margin":"4px 0","borderColor":"#ccc"}),
                         html.Div(html.Span("— Member",
@@ -275,6 +326,14 @@ app.layout = html.Div(
                 ),
             ],
             style={"position":"relative"},
+        ),
+
+        # Live simulation metrics (value at the minute shown on the slider)
+        html.Div(
+            [metric_card(cid, label) for cid, label in METRICS],
+            style={"display":"flex","flexWrap":"wrap","gap":"8px",
+                   "padding":"8px 20px","background":"#f4f4f4",
+                   "borderTop":"1px solid #ddd"},
         ),
 
         # Controls
@@ -320,16 +379,16 @@ app.layout = html.Div(
 # ── Server callbacks ───────────────────────────────────────────────────────────
 
 @app.callback(
-    Output("loaded-date", "data"),
     Output("total-trips", "children"),
-    Output("trip-store", "data"),
+    Output("sim-store", "data"),
     Input("date-picker", "date"),
+    Input("policy-select", "value"),
 )
-def on_date_change(date_str):
-    if not date_str:
-        return no_update, no_update, no_update
-    df = get_day_df(date_str)
-    return date_str, f"{len(df):,} trips on {date_str}", serialize_trips(df)
+def on_simulation_change(date_str, policy):
+    if not date_str or not policy:
+        return no_update, no_update
+    sim = get_simulation(date_str, policy)
+    return f"{sim['n_requests']:,} bike requests on {date_str}", sim
 
 
 @app.callback(
@@ -357,11 +416,12 @@ def advance_time(_, current_min, speed):
 
 # ── Clientside: animation — rebuilds the figure; uirevision keeps the view ────
 app.clientside_callback(
-    _ANIMATION_JS,
+    _ANIMATION_JS.replace("__N_OUTPUTS__", str(2 + len(METRICS))),
     Output("map", "figure"),
     Output("time-display", "children"),
+    *[Output(cid, "children") for cid, _ in METRICS],
     Input("time-slider", "value"),
-    Input("trip-store", "data"),
+    Input("sim-store", "data"),
     State("station-store", "data"),
     State("map-layout", "data"),
     prevent_initial_call=True,
@@ -369,7 +429,7 @@ app.clientside_callback(
 
 
 if __name__ == "__main__":
-    print(f"Preloading {DEFAULT_DATE} ...")
-    get_day_df(DEFAULT_DATE)
+    print(f"Simulating {DEFAULT_DATE} ...")
+    get_simulation(DEFAULT_DATE, DEFAULT_POLICY)
     print("Starting Dash at http://localhost:8050")
     app.run(debug=False, port=8050)

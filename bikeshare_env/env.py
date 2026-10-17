@@ -22,6 +22,10 @@ MINUTES_PER_DAY = 1440
 DATA_FIRST_DATE = pd.Timestamp("2026-01-01")
 DATA_LAST_DATE = pd.Timestamp("2026-09-30")
 TORONTO_CENTER = (43.655, -79.38)
+# ceil(capacity * 0.35) per station = 7,824 bikes (37.7% of 20,780 docks), matching
+# live GBFS at midnight (~7.9k rentable of ~8.8k docked) and ~6-10k bikes/day in
+# the summer 2026 trip data. 0.5 would start with 10,856 bikes, ~25% too many.
+DEFAULT_INIT_OCCUPANCY = 0.35
 # Toronto Island stations: ferry-only, no road access for trucks.
 ISLAND_STATIONS = (8027, 8028, 8029, 8030, 8070, 8228, 8229)
 
@@ -51,7 +55,7 @@ class BikeShareEnv(gym.Env):
 
     def __init__(
         self,
-        init_occupancy: float = 0.5,
+        init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
         simulation_period: tuple[str, str] = ("2026-06-15", "2026-06-15"),
         step_minutes: int = 1,
         # pricing
@@ -176,6 +180,7 @@ class BikeShareEnv(gym.Env):
         self.t = 0
         self.bikes = self._init_bikes()
         self.trip_ptr = 0
+        self.trip_started = np.zeros(len(self.trips), dtype=bool)  # per trip row
         self.returns = defaultdict(list)    # minute -> [(station, rent_min)]
         self.overflow = defaultdict(list)   # release minute -> [(station, rent_min)]
         self.trucks = [_Truck(location=self.depot_idx) for _ in range(self.n_trucks)]
@@ -230,6 +235,7 @@ class BikeShareEnv(gym.Env):
             st = tr.start_idx[i]
             if self.bikes[st] > 0:
                 self.bikes[st] -= 1
+                self.trip_started[i] = True
                 acc["unlock_revenue"] += self.unlock_fee
                 acc["trips_started"] += 1
                 self.returns[max(int(tr.end_min[i]), t + 1)].append(
