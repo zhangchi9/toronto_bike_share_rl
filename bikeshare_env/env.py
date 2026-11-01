@@ -32,7 +32,7 @@ ISLAND_STATIONS = (8027, 8028, 8029, 8030, 8070, 8228, 8229)
 _COST_KEYS = ("unlock_revenue", "return_revenue", "overflow_revenue", "lost_penalty",
               "labor_cost", "fuel_cost", "fixed_cost")
 _COUNT_KEYS = ("trips_started", "lost_trips", "returns_docked", "overflow_returns",
-               "overflow_placed", "bikes_moved", "truck_km")
+               "overflow_placed", "bikes_moved", "truck_km", "minutes_elapsed")
 
 
 @dataclass
@@ -58,6 +58,7 @@ class BikeShareEnv(gym.Env):
         init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
         simulation_period: tuple[str, str] = ("2026-06-15", "2026-06-15"),
         step_minutes: int = 1,
+        skip_when_all_busy: bool = True,
         # pricing
         unlock_fee: float = 1.0,
         per_min_fee: float = 0.15,
@@ -97,6 +98,9 @@ class BikeShareEnv(gym.Env):
         self.n_days = (end - start).days + 1
         self.total_minutes = self.n_days * MINUTES_PER_DAY
         self.step_minutes = int(step_minutes)
+        # When every truck is on a mission there's no decision to make, so step()
+        # keeps simulating until a truck is idle (or the period ends).
+        self.skip_when_all_busy = bool(skip_when_all_busy)
 
         self.unlock_fee = unlock_fee
         self.per_min_fee = per_min_fee
@@ -190,11 +194,17 @@ class BikeShareEnv(gym.Env):
     def step(self, action):
         acc = dict.fromkeys(_COST_KEYS + _COUNT_KEYS, 0.0)
         self._dispatch(np.asarray(action).reshape(self.n_trucks, 3), acc)
+        start_t = self.t
         for _ in range(self.step_minutes):
             if self.t >= self.total_minutes:
                 break
             self._simulate_minute(acc)
             self.t += 1
+        if self.skip_when_all_busy and self.n_trucks > 0:
+            while self.t < self.total_minutes and all(tk.busy(self.t) for tk in self.trucks):
+                self._simulate_minute(acc)
+                self.t += 1
+        acc["minutes_elapsed"] = self.t - start_t
 
         reward = (acc["unlock_revenue"] + acc["return_revenue"] + acc["overflow_revenue"]
                   - acc["lost_penalty"] - acc["labor_cost"] - acc["fuel_cost"]

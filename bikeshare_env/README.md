@@ -52,9 +52,14 @@ python -m pytest tests -q
 ## 2. How the simulation works
 
 ### Time
-- One `step()` = `step_minutes` simulated minutes (default **1**).
+- A `step()` simulates `step_minutes` minutes (default **1**). Then, if **every truck is busy**,
+  it keeps simulating until at least one truck is idle (`skip_when_all_busy=True`, the default).
+  The agent is only asked for an action when it can actually dispatch a truck, and the reward
+  returned covers all the minutes that passed. `info["minutes_elapsed"]` says how many.
 - An episode covers the **whole `simulation_period`**, starting at 00:00 of the first date and
-  ending after 23:59 of the last date. One day is 1,440 steps.
+  ending after 23:59 of the last date. That's 1,440 minutes per day; the number of steps is fewer
+  whenever trucks are busy. With `skip_when_all_busy=False`, every step is exactly
+  `step_minutes` minutes.
 - Bike positions carry over between days. `terminated` becomes `True` at the end of the period;
   `truncated` is always `False`.
 
@@ -104,8 +109,10 @@ A **mission** is *pick up up to `qty` bikes at station A and drop them at statio
 
 The truck then waits, idle, wherever it finished.
 
-**Missions can't be cancelled.** While a truck is busy, its row of the action is ignored. Use
-`info["idle_trucks"]` or `obs["truck_busy"]` to see which trucks will accept an order.
+**Missions can't be cancelled.** When all trucks are busy, the env doesn't ask for a decision at
+all (see *Time*). When only some are busy, the agent is asked, and the busy trucks' rows are
+ignored. Use `info["idle_trucks"]` or `obs["truck_busy"]` to see which trucks will accept an
+order.
 
 Missions that pick up from or drop off at the 7 Toronto Island stations are ignored (ferry-only, no
 road access), and leftovers are never dropped there. Change this with `truck_blocked_stations`.
@@ -176,6 +183,7 @@ has to learn those patterns. For algorithms that need a flat vector, wrap with
 |---|---|
 | `unlock_revenue`, `return_revenue`, `overflow_revenue`, `lost_penalty`, `labor_cost`, `fuel_cost`, `fixed_cost` | This step's reward components ($) |
 | `trips_started`, `lost_trips`, `returns_docked`, `overflow_returns`, `overflow_placed`, `bikes_moved`, `truck_km` | This step's counts |
+| `minutes_elapsed` | Simulated minutes this step covered (more than `step_minutes` when the env skipped ahead while all trucks were busy) |
 | `totals` | The same keys, summed since `reset()` |
 | `idle_trucks` | `(K,)` bool: trucks that will accept a new mission |
 | `minute` | Minutes elapsed since the start of the period |
@@ -192,7 +200,8 @@ Every parameter can be passed to `gym.make("BikeShareToronto-v0", ...)`.
 |---|---|---|
 | `init_occupancy` | `0.35` | Initial bikes per station = `ceil(capacity × init_occupancy)` |
 | `simulation_period` | `("2026-06-15", "2026-06-15")` | Inclusive `(start, end)` dates within 2026-01-01 … 2026-09-30 |
-| `step_minutes` | `1` | Minutes simulated per `step()`; the action is applied at the first one |
+| `step_minutes` | `1` | Minimum minutes simulated per `step()`; the action is applied at the first one |
+| `skip_when_all_busy` | `True` | While every truck is busy, keep simulating inside `step()` until one is idle, so no decision is requested when none can be made |
 | `unlock_fee` | `1.0` | $ per started rental |
 | `per_min_fee` | `0.15` | $ per rented minute on a normal return |
 | `overflow_per_min_fee` | `0.10` | $ per rented minute when the return was blocked |
@@ -250,7 +259,7 @@ r = simulate_day("2026-06-15", "no_rebalancing")   # key from POLICIES
 r.reward.sum(), r.fulfilled.sum(), r.lost.sum(), r.blocked.sum(), r.pending.max()
 ```
 
-`DayRollout` holds `(1440,)` arrays `reward`, `fulfilled`, `lost`, `active`, `blocked` and
+`simulate_day` runs with `skip_when_all_busy=False`, so it records every minute. `DayRollout` holds `(1440,)` arrays `reward`, `fulfilled`, `lost`, `active`, `blocked` and
 `pending`, plus `bikes` `(1440, N)`, `trips`, `trip_started` and `totals`.
 
 ### Dashboard

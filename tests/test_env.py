@@ -22,6 +22,7 @@ def make_env(capacity=(10, 10, 10, 10), trips=(), occupancy=0.5, **kw):
     cols = ["start_min", "end_min", "start_idx", "end_idx", "rent_min"]
     events = TripEvents.from_frame(pd.DataFrame(list(trips), columns=cols))
     kw.setdefault("depot_station", 100)
+    kw.setdefault("skip_when_all_busy", False)   # most tests step minute by minute
     env = BikeShareEnv(init_occupancy=occupancy, simulation_period=("2026-06-15", "2026-06-16"),
                        stations=stations, trips=events,
                        road_dist_km=DIST, road_time_min=TIME, **kw)
@@ -129,6 +130,20 @@ def test_truck_missions_to_blocked_stations_are_noops():
     env = make_env(n_trucks=1, truck_blocked_stations=(103,))
     _, _, _, _, info = env.step(np.array([[1 + 1, 3, 2]]))
     assert info["idle_trucks"][0] and info["fixed_cost"] == 0
+
+
+def test_step_skips_minutes_while_all_trucks_busy():
+    # Mission: drive 0->1 2 min, load 3 3 min, drive 1->3 4 min, unload 3 3 min = 12 min.
+    env = make_env(n_trucks=1, trips=[(5, 7, 2, 0, 2)], skip_when_all_busy=True)
+    _, r, _, _, info = env.step(np.array([[1 + 1, 3, 3]]))
+    assert info["minutes_elapsed"] == 12 and env.t == 12
+    assert info["idle_trucks"][0]
+    # The rental at minute 5 and its return at 7 happened inside the skipped minutes.
+    assert info["trips_started"] == 1 and info["returns_docked"] == 1
+    assert r == pytest.approx(1.0 + 0.15 * 2 - 100 - 160 - 12 * 40 / 60 - 0.3 * 3)
+    # With an idle truck, a step is one minute again.
+    _, _, _, _, info = env.step(noop(env))
+    assert info["minutes_elapsed"] == 1
 
 
 def test_episode_length_and_termination():
