@@ -8,10 +8,11 @@ import numpy as np
 
 class Policy:
     label = "Base policy"
+    number_trucks = 2   # fleet the policy is run with (hired every day, used or not)
 
     def reset(self, env) -> None:
         """Called once after env.reset(); `env` is the unwrapped BikeShareEnv."""
-        self.n_trucks = env.n_trucks
+        self.number_trucks = env.number_trucks
 
     def act(self, obs: dict, info: dict) -> np.ndarray:
         raise NotImplementedError
@@ -20,9 +21,10 @@ class Policy:
 class NoRebalancingPolicy(Policy):
     """Dummy baseline: never hires a truck or dispatches a mission."""
     label = "No rebalancing (dummy)"
+    number_trucks = 0   # hires no trucks, so pays no truck costs
 
     def act(self, obs, info):
-        return np.zeros((self.n_trucks, 3), dtype=np.int64)
+        return np.zeros((self.number_trucks, 3), dtype=np.int64)
 
 
 POLICIES: dict[str, type[Policy]] = {

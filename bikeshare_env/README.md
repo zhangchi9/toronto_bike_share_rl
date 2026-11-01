@@ -11,7 +11,8 @@ import bikeshare_env  # registers BikeShareToronto-v0
 
 env = gym.make("BikeShareToronto-v0",
                init_occupancy=0.35,
-               simulation_period=("2026-06-15", "2026-06-21"))
+               simulation_period=("2026-06-15", "2026-06-21"),
+               number_trucks=2)
 obs, info = env.reset(seed=0)
 done = False
 while not done:
@@ -118,10 +119,13 @@ Missions that pick up from or drop off at the 7 Toronto Island stations are igno
 road access), and leftovers are never dropped there. Change this with `truck_blocked_stations`.
 
 ### Costs
+The fleet size `number_trucks` is a **hyperparameter you choose, not something the policy
+optimizes**. Every truck is hired for every simulated day, whether it moves or not.
+
 | Cost | Rule (defaults) |
 |---|---|
-| Truck fixed cost | **$100** per truck per calendar day, charged the first time that truck is dispatched that day |
-| Driver shift | Charged at the same moment: the full shift **09:00–17:00** at the hourly rate = 8 h × $20 = **$160**, even if the truck is busy for only a few minutes |
+| Truck fixed cost | **$100** per truck per day, charged at 00:00 of each day for the whole fleet |
+| Driver shift | Charged at the same moment: the full shift **09:00–17:00** at the hourly rate = 8 h × $20 = **$160** per truck |
 | Overtime | Each minute a truck is busy **outside** the shift: **$20/h** between 09:00–17:00, **$40/h** otherwise |
 | Fuel | **$0.30 per km** of road distance, for every leg (including empty drives to the pickup), charged when the leg starts |
 
@@ -144,7 +148,7 @@ normalizing it for learning.
 
 ## 3. Spaces
 
-`N` = number of stations (1,072), `K` = `n_trucks` (default 2). Station **index** `i` = row `i` of
+`N` = number of stations (1,072), `K` = `number_trucks` (default 2). Station **index** `i` = row `i` of
 `data/stations.json`. Map indices to GBFS station ids with `env.unwrapped.station_ids[i]`.
 
 ### Action: `MultiDiscrete`, shape `(K, 3)`
@@ -207,7 +211,7 @@ Every parameter can be passed to `gym.make("BikeShareToronto-v0", ...)`.
 | `overflow_per_min_fee` | `0.10` | $ per rented minute when the return was blocked |
 | `overflow_delay_min` | `15` | Minutes a blocked bike is unavailable |
 | `lost_trip_penalty` | `0.5` | $ subtracted per lost request |
-| `n_trucks` | `2` | Fleet size |
+| `number_trucks` | `2` | Fleet size (hyperparameter). Each truck costs $100 + its shift every day, used or not. `0` = no trucks: the action space is empty, shape `(0, 3)` |
 | `truck_capacity` | `20` | Bikes per truck |
 | `load_min_per_bike` | `1.0` | Minutes to load or unload one bike |
 | `depot_station` | `None` | Station **id** where trucks start; default = station nearest downtown (Eaton Centre) |
@@ -215,7 +219,7 @@ Every parameter can be passed to `gym.make("BikeShareToronto-v0", ...)`.
 | `shift` | `(9, 17)` | Paid driver shift, hours |
 | `day_hours` | `(9, 17)` | Hours billed at `day_rate`; others at `night_rate` |
 | `day_rate`, `night_rate` | `20.0`, `40.0` | Labor $ per hour per truck |
-| `truck_fixed_cost` | `100.0` | $ per truck per day used |
+| `truck_fixed_cost` | `100.0` | $ per truck per day |
 | `fuel_cost_per_km` | `0.3` | $ per road km |
 | `stations`, `trips`, `road_dist_km`, `road_time_min` | `None` | Inject your own data instead of loading from `data/` (used by the unit tests) |
 
@@ -232,9 +236,10 @@ from bikeshare_env.policies import Policy, POLICIES
 
 class MoveFromFullestToEmptiest(Policy):
     label = "Fullest -> emptiest (example)"
+    number_trucks = 2                               # fleet this policy runs with
 
     def act(self, obs, info):
-        action = np.zeros((self.n_trucks, 3), dtype=np.int64)
+        action = np.zeros((self.number_trucks, 3), dtype=np.int64)
         if obs["minute_of_day"][0] % 60:            # decide once an hour
             return action
         fill = obs["bikes"] / np.maximum(obs["bikes"] + obs["free_docks"], 1)
@@ -247,8 +252,13 @@ class MoveFromFullestToEmptiest(Policy):
 POLICIES["fullest_to_emptiest"] = MoveFromFullestToEmptiest
 ```
 
+Each policy declares the fleet it runs with in `number_trucks` (default 2). The dashboard and
+`simulate_day` build the env with that fleet. The dummy `no_rebalancing` policy declares **0**, so
+it pays no truck costs.
+
 `Policy.reset(env)` is called once with the unwrapped env, so you can read static data such as
-`env.capacity`, `env.dist_km` or `env.station_ids`.
+`env.capacity`, `env.dist_km` or `env.station_ids`. It also sets `self.number_trucks` to the env's
+actual fleet size.
 
 Run one day under a policy and get per-minute series (what the dashboard plots):
 
@@ -275,7 +285,7 @@ it: station fill level, rides in progress, and live metrics under the map.
 
 ## 6. Baseline numbers
 
-No rebalancing (`no_rebalancing`), `init_occupancy=0.35`, 2026-06-15 (a Monday):
+No rebalancing (`no_rebalancing`, 0 trucks), `init_occupancy=0.35`, 2026-06-15 (a Monday):
 
 | Metric | Value |
 |---|---|

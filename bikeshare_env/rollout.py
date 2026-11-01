@@ -27,13 +27,14 @@ class DayRollout:
 
 def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
                  **env_kwargs) -> DayRollout:
+    policy = POLICIES[policy_key]()
+    env_kwargs.setdefault("number_trucks", policy.number_trucks)
     # One step per minute so every minute is recorded, even while trucks are busy.
     env = gym.make("BikeShareToronto-v0", init_occupancy=init_occupancy,
                    simulation_period=(date, date), skip_when_all_busy=False,
                    **env_kwargs)
     u: BikeShareEnv = env.unwrapped
     obs, info = env.reset(seed=0)
-    policy = POLICIES[policy_key]()
     policy.reset(u)
 
     T, N = MINUTES_PER_DAY, u.n_stations

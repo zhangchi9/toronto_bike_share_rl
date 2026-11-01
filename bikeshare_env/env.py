@@ -42,7 +42,6 @@ class _Truck:
     busy_until: int = 0                       # minute the current op finishes
     ops: deque = field(default_factory=deque) # remaining ops of the mission
     pending_qty: int = 0                      # requested qty for the load op
-    last_paid_day: int = -1                   # day the shift + fixed cost was paid
 
     def busy(self, t: int) -> bool:
         return self.busy_until > t or bool(self.ops)
@@ -66,7 +65,7 @@ class BikeShareEnv(gym.Env):
         overflow_delay_min: int = 15,
         lost_trip_penalty: float = 0.5,
         # fleet / costs
-        n_trucks: int = 2,
+        number_trucks: int = 2,
         truck_capacity: int = 20,
         load_min_per_bike: float = 1.0,
         depot_station: int | None = None,
@@ -108,7 +107,9 @@ class BikeShareEnv(gym.Env):
         self.overflow_delay_min = int(overflow_delay_min)
         self.lost_trip_penalty = lost_trip_penalty
 
-        self.n_trucks = int(n_trucks)
+        # Fleet size is a fixed hyperparameter: every truck is hired (fixed cost +
+        # full shift) every simulated day, whether the policy uses it or not.
+        self.number_trucks = int(number_trucks)
         self.truck_capacity = int(truck_capacity)
         self.load_min_per_bike = load_min_per_bike
         self.shift = shift
@@ -150,10 +151,10 @@ class BikeShareEnv(gym.Env):
         self.shift_cost = sum(self._hourly_rate(h) for h in range(*shift))
 
         # ── spaces ───────────────────────────────────────────────────────────
-        n, k = self.n_stations, self.n_trucks
+        n, k = self.n_stations, self.number_trucks
         cap_max = float(self.capacity.max())
         self.action_space = spaces.MultiDiscrete(
-            np.array([[n + 1, n, self.truck_capacity + 1]] * k, dtype=np.int64))
+            np.array([[n + 1, n, self.truck_capacity + 1]] * k, dtype=np.int64).reshape(k, 3))
         f32 = np.float32
         self.observation_space = spaces.Dict({
             "bikes": spaces.Box(0, cap_max, (n,), f32),
@@ -187,20 +188,20 @@ class BikeShareEnv(gym.Env):
         self.trip_started = np.zeros(len(self.trips), dtype=bool)  # per trip row
         self.returns = defaultdict(list)    # minute -> [(station, rent_min)]
         self.overflow = defaultdict(list)   # release minute -> [(station, rent_min)]
-        self.trucks = [_Truck(location=self.depot_idx) for _ in range(self.n_trucks)]
+        self.trucks = [_Truck(location=self.depot_idx) for _ in range(self.number_trucks)]
         self.totals = dict.fromkeys(_COST_KEYS + _COUNT_KEYS, 0.0)
         return self._obs(), self._info(dict.fromkeys(_COST_KEYS + _COUNT_KEYS, 0.0))
 
     def step(self, action):
         acc = dict.fromkeys(_COST_KEYS + _COUNT_KEYS, 0.0)
-        self._dispatch(np.asarray(action).reshape(self.n_trucks, 3), acc)
+        self._dispatch(np.asarray(action).reshape(self.number_trucks, 3), acc)
         start_t = self.t
         for _ in range(self.step_minutes):
             if self.t >= self.total_minutes:
                 break
             self._simulate_minute(acc)
             self.t += 1
-        if self.skip_when_all_busy and self.n_trucks > 0:
+        if self.skip_when_all_busy and self.number_trucks > 0:
             while self.t < self.total_minutes and all(tk.busy(self.t) for tk in self.trucks):
                 self._simulate_minute(acc)
                 self.t += 1
@@ -217,6 +218,10 @@ class BikeShareEnv(gym.Env):
     # ── simulation ───────────────────────────────────────────────────────────
     def _simulate_minute(self, acc: dict) -> None:
         t = self.t
+        if t % MINUTES_PER_DAY == 0:
+            # Daily hire of the whole fleet: fixed cost + full driver shift per truck.
+            acc["fixed_cost"] += self.truck_fixed_cost * self.number_trucks
+            acc["labor_cost"] += self.shift_cost * self.number_trucks
         self._advance_trucks(acc)
 
         # Returns due now: dock if there's room, otherwise hold for overflow delay.
@@ -280,11 +285,6 @@ class BikeShareEnv(gym.Env):
             a, b = pickup - 1, dropoff
             if a == b or self.truck_blocked[a] or self.truck_blocked[b]:
                 continue
-            day = self.t // MINUTES_PER_DAY
-            if tk.last_paid_day != day:
-                tk.last_paid_day = day
-                acc["fixed_cost"] += self.truck_fixed_cost
-                acc["labor_cost"] += self.shift_cost
             tk.pending_qty = min(qty, self.truck_capacity)
             tk.ops = deque([("drive", a), ("load", a), ("drive", b), ("unload", b)])
             self._run_ops(tk, acc)
