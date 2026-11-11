@@ -23,6 +23,12 @@ class DayRollout:
     trips: TripEvents
     trip_started: np.ndarray   # (n_trips,) bool, request was served
     totals: dict
+    # Trucks (empty when the policy has none):
+    truck_legs: np.ndarray     # (n_legs, 6) int: truck, from, to, depart, arrive, load
+    truck_status: np.ndarray   # (1440, K) int8: 0 idle, 1 driving, 2 loading/unloading
+    truck_load: np.ndarray     # (1440, K) bikes on each truck after that minute
+    truck_station: np.ndarray  # (1440, K) station the truck is at / driving to
+    truck_moved: np.ndarray    # (1440,) cumulative bikes moved by trucks
 
 
 def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
@@ -46,8 +52,33 @@ def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INI
     blocked = np.zeros(T, dtype=np.int64)
     pending = np.zeros(T, dtype=np.int64)
     riding = held = 0
+    K = u.number_trucks
+    legs = []
+    truck_status = np.zeros((T, K), dtype=np.int8)
+    truck_load = np.zeros((T, K), dtype=np.int16)
+    truck_station = np.zeros((T, K), dtype=np.int32)
+    truck_moved = np.zeros(T, dtype=np.int64)
+    prev_loc = [tk.location for tk in u.trucks]
+    last_leg = [None] * K
+    moved = 0
     for m in range(T):
         obs, r, done, _, info = env.step(policy.act(obs, info))
+        # A drive op sets the truck's location to its destination and busy_until to
+        # the arrival minute when it starts, so a location change = a new leg.
+        for k, tk in enumerate(u.trucks):
+            if tk.location != prev_loc[k]:
+                last_leg[k] = (k, prev_loc[k], tk.location, m, tk.busy_until, tk.load)
+                legs.append(last_leg[k])
+                prev_loc[k] = tk.location
+            leg = last_leg[k]
+            if leg is not None and leg[3] <= m < leg[4]:
+                truck_status[m, k] = 1
+            elif tk.busy_until > m or tk.ops:
+                truck_status[m, k] = 2
+            truck_load[m, k] = tk.load
+            truck_station[m, k] = tk.location
+        moved += info["bikes_moved"]
+        truck_moved[m] = moved
         bikes[m] = u.bikes
         reward[m] = r
         fulfilled[m] = info["trips_started"]
@@ -61,4 +92,6 @@ def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INI
         if done:
             break
     return DayRollout(bikes, reward, fulfilled, lost, active, blocked, pending,
-                      u.trips, u.trip_started.copy(), dict(info["totals"]))
+                      u.trips, u.trip_started.copy(), dict(info["totals"]),
+                      np.array(legs, dtype=np.int64).reshape(-1, 6),
+                      truck_status, truck_load, truck_station, truck_moved)

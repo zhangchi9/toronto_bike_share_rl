@@ -18,6 +18,11 @@ from bikeshare_env.policies import POLICIES
 from bikeshare_env.rollout import simulate_day
 from data_loader import load_stations
 
+try:   # adds trained RL models (models/*/best_model.zip) to the Policy dropdown
+    import rl.policy  # noqa: F401
+except ImportError as e:
+    print(f"RL policies not loaded: {e}")
+
 # ── Globals ───────────────────────────────────────────────────────────────────
 STATIONS_DF = load_stations()
 
@@ -36,7 +41,24 @@ _STATION_STORE = {
 }
 
 
-@lru_cache(maxsize=4)
+def trucks_payload(r) -> dict | None:
+    """Truck trips (with their road route) and per-minute truck state."""
+    K = r.truck_status.shape[1]
+    if K == 0:
+        return None
+    from road_routes import get_router
+    router = get_router()
+    legs = []
+    for k, a, b, depart, arrive, load in r.truck_legs.tolist():
+        lat, lon = router.route(a, b)
+        legs.append({"k": k, "depart": depart, "arrive": arrive, "load": load,
+                     "to": b, "lat": list(lat), "lon": list(lon)})
+    return {"n": K, "legs": legs,
+            "status": r.truck_status.T.tolist(), "load": r.truck_load.T.tolist(),
+            "station": r.truck_station.T.tolist(), "moved": r.truck_moved.tolist()}
+
+
+@lru_cache(maxsize=12)
 def get_simulation(date_str: str, policy: str) -> dict:
     """Simulate one day and serialize it for the browser (~3 MB)."""
     r = simulate_day(date_str, policy, init_occupancy=INIT_OCCUPANCY)
@@ -57,6 +79,7 @@ def get_simulation(date_str: str, policy: str) -> dict:
             "casual": t.casual.tolist(), "ok": r.trip_started.astype(int).tolist(),
         },
         "n_requests": len(t),
+        "trucks": trucks_payload(r),
     }
 
 
@@ -90,15 +113,25 @@ BASEMAP_STYLE = {
     ],
 }
 
-MAP_LAYOUT = {
-    "map": {"style": BASEMAP_STYLE, "center": TORONTO_CENTER, "zoom": 11},
-    "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
-    "showlegend": False,
-    "uirevision": "keep-view",
-}
+# Truck icons come from a sprite sheet in assets/ (make_truck_icons.py). MapLibre
+# needs an absolute sprite URL, so the layout is built per page load.
+TRUCK_SPRITE_PATH = "assets/truck_sprite/sprite"
 
 
-def build_base_figure() -> dict:
+def map_layout(base_url: str) -> dict:
+    # Plotly's icon layers declare a text font, and MapLibre rejects such a layer
+    # unless the style has a glyphs URL (it's never fetched: no text is drawn).
+    style = dict(BASEMAP_STYLE, id="faded-osm-trucks", sprite=base_url + TRUCK_SPRITE_PATH,
+                 glyphs="https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf")
+    return {
+        "map": {"style": style, "center": TORONTO_CENTER, "zoom": 11},
+        "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+        "showlegend": False,
+        "uirevision": "keep-view",
+    }
+
+
+def build_base_figure(layout: dict) -> dict:
     sdf = STATIONS_DF
     return {
         "data": [{
@@ -110,7 +143,7 @@ def build_base_figure() -> dict:
                      + sdf["capacity"].astype(str) + " docks").tolist(),
             "hoverinfo": "text",
         }],
-        "layout": MAP_LAYOUT,
+        "layout": layout,
     }
 
 
@@ -136,7 +169,20 @@ function(current_min, sim, station_data, layout) {
         for (var m=0; m<sim.reward.length; m++) {
             for (var key in acc) { acc[key] += sim[key][m]; cum[key].push(acc[key]); }
         }
-        window._bsSim = {key: sim.key, bikes: u8, cum: cum};
+        // Per truck: its trips in time order, with cumulative distance along the route.
+        var legsBy = [];
+        if (sim.trucks) {
+            for (var q=0; q<sim.trucks.n; q++) legsBy.push([]);
+            sim.trucks.legs.forEach(function(L) {
+                var d=[0];
+                for (var p=1; p<L.lat.length; p++) {
+                    var dy=L.lat[p]-L.lat[p-1], dx=(L.lon[p]-L.lon[p-1])*0.72;
+                    d.push(d[p-1]+Math.sqrt(dx*dx+dy*dy));
+                }
+                L.cum=d; legsBy[L.k].push(L);
+            });
+        }
+        window._bsSim = {key: sim.key, bikes: u8, cum: cum, legs: legsBy};
     }
     var S = window._bsSim;
 
@@ -165,6 +211,69 @@ function(current_min, sim, station_data, layout) {
     var mm=String(t%60).padStart(2,'0');
     var timeText=hh+':'+mm;
 
+    // ── Trucks: position along the road route of the trip in progress ──────────
+    function clock(m) {
+        return String(Math.floor(m/60)%24).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+    }
+    var truckTraces=[], truckCard='No trucks', movedCard='–';
+    var TRUCK_COL=['#7b1fa2','#00838f','#ad1457','#2e7d32'];   // route line per truck
+    var ICON={drive_full:'full', drive_empty:'empty', handling:'handling', idle:'idle'};
+    if (sim.trucks) {
+        var TK=sim.trucks, icons={lat:[],lon:[],symbol:[],text:[]};
+        var cardParts=[];
+        S.facing = S.facing || [];
+        for (var k=0; k<TK.n; k++) {
+            var st=TK.status[k][t], load=TK.load[k][t], at=TK.station[k][t];
+            var plat=stLat[at], plon=stLon[at], desc, state, leg=null;
+            if (st===1) {
+                var Ls=S.legs[k];
+                for (var j=Ls.length-1; j>=0; j--) {
+                    if (Ls[j].depart<=t && t<Ls[j].arrive) { leg=Ls[j]; break; }
+                }
+            }
+            if (leg) {
+                // Fraction of the drive done by the end of minute t.
+                var f=Math.min(1, (t+1-leg.depart)/Math.max(1, leg.arrive-leg.depart));
+                var target=f*leg.cum[leg.cum.length-1], p=1;
+                while (p<leg.cum.length-1 && leg.cum[p]<target) p++;
+                var seg=leg.cum[p]-leg.cum[p-1], w=seg>0 ? (target-leg.cum[p-1])/seg : 1;
+                plat=leg.lat[p-1]+w*(leg.lat[p]-leg.lat[p-1]);
+                plon=leg.lon[p-1]+w*(leg.lon[p]-leg.lon[p-1]);
+                // Face the direction of travel on the current road segment.
+                var dx=leg.lon[p]-leg.lon[p-1];
+                if (Math.abs(dx)>1e-6) S.facing[k] = dx>0 ? 'r' : 'l';
+                var col=TRUCK_COL[k%TRUCK_COL.length];
+                truckTraces.push({type:'scattermap', mode:'lines', hoverinfo:'skip',
+                    lat:leg.lat.slice(0,p).concat([plat]), lon:leg.lon.slice(0,p).concat([plon]),
+                    line:{color:col, width:3}, opacity:0.35});
+                truckTraces.push({type:'scattermap', mode:'lines', hoverinfo:'skip',
+                    lat:[plat].concat(leg.lat.slice(p)), lon:[plon].concat(leg.lon.slice(p)),
+                    line:{color:col, width:5}, opacity:0.9});
+                state = leg.load>0 ? 'drive_full' : 'drive_empty';
+                desc = 'driving '+(leg.load>0 ? leg.load+' bikes' : 'empty')+' to '
+                       +stName[leg.to]+', arrives '+clock(leg.arrive);
+                cardParts.push('T'+(k+1)+': \u2192 '+stName[leg.to]
+                               +(leg.load>0 ? ' ('+leg.load+' bikes)' : ' (empty)'));
+            } else if (st===2) {
+                state='handling';
+                desc='loading / unloading at '+stName[at]+' ('+load+' bikes on board)';
+                cardParts.push('T'+(k+1)+': loading/unloading at '+stName[at]);
+            } else {
+                state='idle';
+                desc='idle at '+stName[at];
+                cardParts.push('T'+(k+1)+': idle');
+            }
+            icons.lat.push(plat); icons.lon.push(plon);
+            icons.symbol.push('truck-'+ICON[state]+'-'+(S.facing[k] || 'r'));
+            icons.text.push('<b>Truck '+(k+1)+'</b><br>'+desc);
+        }
+        truckTraces.push({type:'scattermap', mode:'markers', hoverinfo:'text',
+            lat:icons.lat, lon:icons.lon, text:icons.text,
+            marker:{symbol:icons.symbol, size:14, allowoverlap:true}});
+        truckCard=cardParts.join(' \u00b7 ');
+        movedCard=TK.moved[t].toLocaleString();
+    }
+
     function money(x) {
         return (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US',
             {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -180,7 +289,9 @@ function(current_min, sim, station_data, layout) {
         sim.active[t].toLocaleString(),
         sim.blocked[t].toLocaleString(),
         S.cum.blocked[t].toLocaleString(),
-        sim.pending[t].toLocaleString()
+        sim.pending[t].toLocaleString(),
+        truckCard,
+        movedCard
     ];
 
     // Carry over the live camera so Plotly.react never moves the viewport.
@@ -210,7 +321,7 @@ function(current_min, sim, station_data, layout) {
              marker:{color:color, size:size, cmin:0, cmax:1, opacity:0.9,
                      colorscale:[[0,'#e8000b'],[0.15,'#ff9900'],[0.5,'#2ca02c'],[1,'#1f4fd1']]},
              text:text, hoverinfo:'text'}
-        ],
+        ].concat(truckTraces),
         layout: viewLayout
     };
 
@@ -230,6 +341,8 @@ METRICS = [
     ("m-blocked", "Returns blocked this minute (station full)"),
     ("m-cum-blocked", "Total returns blocked"),
     ("m-pending", "Bikes pending (held 15 min)"),
+    ("m-trucks", "Trucks"),
+    ("m-truck-moved", "Bikes moved by trucks"),
 ]
 
 
@@ -249,11 +362,15 @@ def metric_card(card_id: str, label: str) -> html.Div:
 # ── App layout ────────────────────────────────────────────────────────────────
 app = Dash(__name__, title="Bike Share Toronto")
 
-app.layout = html.Div(
+def serve_layout():
+    from flask import has_request_context, request
+    # Dash also calls this once at startup (no request) to validate the layout.
+    layout = map_layout(request.url_root if has_request_context() else "http://localhost:8050/")
+    return html.Div(
     [
         dcc.Store(id="sim-store", data=None),
         dcc.Store(id="station-store", data=_STATION_STORE),
-        dcc.Store(id="map-layout", data=MAP_LAYOUT),
+        dcc.Store(id="map-layout", data=layout),
         dcc.Interval(id="interval", interval=500, disabled=True, n_intervals=0),
 
         # Header
@@ -293,7 +410,7 @@ app.layout = html.Div(
             [
                 dcc.Graph(
                     id="map",
-                    figure=build_base_figure(),
+                    figure=build_base_figure(layout),
                     style={"height":"60vh"},
                     config={"scrollZoom": True, "displayModeBar": False},
                 ),
@@ -316,6 +433,20 @@ app.layout = html.Div(
                                  style={"color":"#3399ff","fontSize":"12px"})),
                         html.Div(html.Span("— Casual",
                                  style={"color":"#ff8833","fontSize":"12px"})),
+                        html.Hr(style={"margin":"4px 0","borderColor":"#ccc"}),
+                        html.Div("Trucks (icon colour = status)",
+                                 style={"fontWeight":"bold","fontSize":"12px"}),
+                        html.Div([
+                            html.Span("● with bikes  ", style={"color":"#6a1b9a","fontSize":"12px"}),
+                            html.Span("● empty", style={"color":"#757575","fontSize":"12px"}),
+                        ]),
+                        html.Div([
+                            html.Span("● loading/unloading  ",
+                                      style={"color":"#ef6c00","fontSize":"12px"}),
+                            html.Span("● idle", style={"color":"#212121","fontSize":"12px"}),
+                        ]),
+                        html.Div(html.Span("━ route ahead (colour per truck), faint = driven",
+                                 style={"color":"#555","fontSize":"12px"})),
                     ],
                     style={
                         "position":"absolute","top":"10px","right":"10px",
@@ -376,6 +507,9 @@ app.layout = html.Div(
 )
 
 
+app.layout = serve_layout
+
+
 # ── Server callbacks ───────────────────────────────────────────────────────────
 
 @app.callback(
@@ -431,5 +565,8 @@ app.clientside_callback(
 if __name__ == "__main__":
     print(f"Simulating {DEFAULT_DATE} ...")
     get_simulation(DEFAULT_DATE, DEFAULT_POLICY)
+    print("Loading road network for truck routes ...")
+    from road_routes import get_router
+    get_router()
     print("Starting Dash at http://localhost:8050")
     app.run(debug=False, port=8050)
