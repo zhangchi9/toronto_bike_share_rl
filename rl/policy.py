@@ -13,7 +13,7 @@ import os
 import numpy as np
 
 from bikeshare_env.policies import POLICIES, Policy
-from rl.features import FeatureBuilder, encode_action
+from rl.features import TRUCK_CAPACITY, FeatureBuilder, encode_action
 from rl.train import model_dir
 from rl.wrapper import static_data
 
@@ -22,6 +22,7 @@ ALGOS = {"ppo": "PPO", "a2c": "A2C", "dqn": "DQN"}
 
 class ZoneActionPolicy(Policy):
     """Asks `choose(obs_vector)` for every idle truck each minute, like RebalanceEnv."""
+    env_overrides = {"truck_capacity": TRUCK_CAPACITY}   # same trucks as in training
 
     def reset(self, env) -> None:
         super().reset(env)

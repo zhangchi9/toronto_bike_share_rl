@@ -18,7 +18,7 @@ from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY, MINUTES_PER_DAY, BikeShare
 from bikeshare_env.road_network import load_road_matrices
 from bikeshare_env.trips import load_period_trips
 from data_loader import load_stations
-from rl.features import FeatureBuilder, n_actions, obs_size
+from rl.features import TRUCK_CAPACITY, FeatureBuilder, n_actions, obs_size
 from rl.zones import N_ZONES, make_zones
 
 # Data split. Validation (checkpoint selection) is the end of the training months;
@@ -50,6 +50,7 @@ def make_base_env(window, number_trucks, init_occupancy, trips=None) -> BikeShar
         trips = load_period_trips(window[0], window[1], s["ids"])
     return BikeShareEnv(init_occupancy=init_occupancy, simulation_period=window,
                         number_trucks=number_trucks, skip_when_all_busy=False,
+                        truck_capacity=TRUCK_CAPACITY,
                         stations=s["stations"], trips=trips,
                         road_dist_km=s["dist"], road_time_min=s["time"])
 

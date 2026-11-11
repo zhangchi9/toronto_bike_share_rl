@@ -35,6 +35,8 @@ def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INI
                  **env_kwargs) -> DayRollout:
     policy = POLICIES[policy_key]()
     env_kwargs.setdefault("number_trucks", policy.number_trucks)
+    for key, value in policy.env_overrides.items():
+        env_kwargs.setdefault(key, value)
     # One step per minute so every minute is recorded, even while trucks are busy.
     env = gym.make("BikeShareToronto-v0", init_occupancy=init_occupancy,
                    simulation_period=(date, date), skip_when_all_busy=False,

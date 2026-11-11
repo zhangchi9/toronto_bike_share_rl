@@ -33,6 +33,16 @@ DEFAULT_DATE = "2026-06-15"
 DEFAULT_POLICY = "no_rebalancing"
 INIT_OCCUPANCY = DEFAULT_INIT_OCCUPANCY
 
+# RL zones (rl/zones.py) drawn as an optional overlay: outline + centre label.
+try:
+    from rl.wrapper import static_data
+    from rl.zones import zone_outlines
+    _ZONE_STORE = zone_outlines(static_data()["zones"], STATIONS_DF["lat"],
+                                STATIONS_DF["lon"], STATIONS_DF["capacity"])
+except Exception as e:   # noqa: BLE001 - overlay is optional
+    print(f"Zone overlay disabled: {e}")
+    _ZONE_STORE = []
+
 _STATION_STORE = {
     "lat": STATIONS_DF["lat"].tolist(),
     "lon": STATIONS_DF["lon"].tolist(),
@@ -152,7 +162,7 @@ def build_base_figure(layout: dict) -> dict:
 # station colour = fill level (bikes / docks), arcs = rides in progress (only
 # requests the simulation actually served), plus the metric cards.
 _ANIMATION_JS = """
-function(current_min, sim, station_data, layout) {
+function(current_min, show_zones, sim, station_data, layout, zones) {
     var nu = window.dash_clientside.no_update;
     if (!sim || !station_data || !layout ||
         current_min === null || current_min === undefined) {
@@ -311,8 +321,29 @@ function(current_min, sim, station_data, layout) {
         });
     }
 
+    // ── Zone overlay (outlines under everything, numbers on top) ──────────────
+    var zoneTraces=[], zoneLabels=[];
+    if (zones && zones.length && show_zones && show_zones.indexOf('on')>=0) {
+        var ZC=['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2',
+                '#7f7f7f','#bcbd22','#17becf','#393b79','#637939','#8c6d31','#843c39',
+                '#7b4173','#3182bd','#e6550d','#31a354','#756bb1','#636363'];
+        zones.forEach(function(z, i) {
+            var c=ZC[i%ZC.length];
+            var r=parseInt(c.slice(1,3),16), g=parseInt(c.slice(3,5),16), b=parseInt(c.slice(5,7),16);
+            zoneTraces.push({type:'scattermap', mode:'lines', fill:'toself',
+                fillcolor:'rgba('+r+','+g+','+b+',0.08)', lat:z.lat, lon:z.lon,
+                line:{color:c, width:2}, hoverinfo:'text',
+                text:'Zone '+z.zone+': '+z.stations+' stations, '+z.docks.toLocaleString()+' docks'});
+        });
+        zoneLabels.push({type:'scattermap', mode:'text', hoverinfo:'skip',
+            lat:zones.map(function(z){return z.clat;}), lon:zones.map(function(z){return z.clon;}),
+            text:zones.map(function(z){return 'Z'+z.zone;}),
+            // Fonts come from the style's glyphs server (demotiles has Noto Sans Bold).
+            textfont:{size:15, color:'#111111', family:'Noto Sans Bold'}});
+    }
+
     var figure = {
-        data: [
+        data: zoneTraces.concat([
             {type:'scattermap', mode:'lines', lat:mLat, lon:mLon,
              line:{color:'rgba(51,153,255,0.5)', width:1}, hoverinfo:'skip'},
             {type:'scattermap', mode:'lines', lat:cLat, lon:cLon,
@@ -321,7 +352,7 @@ function(current_min, sim, station_data, layout) {
              marker:{color:color, size:size, cmin:0, cmax:1, opacity:0.9,
                      colorscale:[[0,'#e8000b'],[0.15,'#ff9900'],[0.5,'#2ca02c'],[1,'#1f4fd1']]},
              text:text, hoverinfo:'text'}
-        ].concat(truckTraces),
+        ]).concat(zoneLabels).concat(truckTraces),
         layout: viewLayout
     };
 
@@ -370,6 +401,7 @@ def serve_layout():
     [
         dcc.Store(id="sim-store", data=None),
         dcc.Store(id="station-store", data=_STATION_STORE),
+        dcc.Store(id="zone-store", data=_ZONE_STORE),
         dcc.Store(id="map-layout", data=layout),
         dcc.Interval(id="interval", interval=500, disabled=True, n_intervals=0),
 
@@ -396,6 +428,13 @@ def serve_layout():
                     html.Div(id="total-trips",
                              style={"color":"#aaffaa","marginLeft":"24px","fontSize":"14px"}),
                     type="dot", color="#aaffaa",
+                ),
+                dcc.Checklist(
+                    id="zone-toggle",
+                    options=[{"label": " Show zones", "value": "on"}],
+                    value=["on"],
+                    style={"marginLeft":"16px","fontSize":"14px"},
+                    labelStyle={"color":"#eeeeee","cursor":"pointer"},
                 ),
                 html.Div(id="time-display", children="00:00",
                          style={"color":"#ffff88","marginLeft":"32px",
@@ -555,9 +594,11 @@ app.clientside_callback(
     Output("time-display", "children"),
     *[Output(cid, "children") for cid, _ in METRICS],
     Input("time-slider", "value"),
+    Input("zone-toggle", "value"),
     Input("sim-store", "data"),
     State("station-store", "data"),
     State("map-layout", "data"),
+    State("zone-store", "data"),
     prevent_initial_call=True,
 )
 

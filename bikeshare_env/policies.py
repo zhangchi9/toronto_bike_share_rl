@@ -9,6 +9,7 @@ import numpy as np
 class Policy:
     label = "Base policy"
     number_trucks = 2   # fleet the policy is run with (hired every day, used or not)
+    env_overrides: dict = {}   # extra env settings the policy needs (e.g. truck_capacity)
 
     def reset(self, env) -> None:
         """Called once after env.reset(); `env` is the unwrapped BikeShareEnv."""

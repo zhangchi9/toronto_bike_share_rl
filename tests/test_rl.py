@@ -17,6 +17,7 @@ def env(request):
 
 
 def test_spaces_sizes(env):
+    assert QTY_LEVELS == (10, 20, 40) and env.env.truck_capacity == 40
     assert env.action_space.n == n_actions(20) == 1 + 20 * 19 * len(QTY_LEVELS) == 1141
     assert env.observation_space.shape == (obs_size(20, env.K),) == ((110,) if env.K == 1 else (132,))
 

@@ -17,7 +17,8 @@ import numpy as np
 from bikeshare_env.env import MINUTES_PER_DAY, BikeShareEnv
 from rl.zones import Zones
 
-QTY_LEVELS = (5, 10, 20)
+QTY_LEVELS = (10, 20, 40)
+TRUCK_CAPACITY = 40          # bikes per truck for the RL / zone policies
 HISTORY_MIN = 60
 NET_CHANGE_SCALE = 10.0
 
