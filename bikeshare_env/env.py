@@ -42,6 +42,9 @@ class _Truck:
     busy_until: int = 0                       # minute the current op finishes
     ops: deque = field(default_factory=deque) # remaining ops of the mission
     pending_qty: int = 0                      # requested qty for the load op
+    collected: int = 0                        # bikes picked up this mission (multi-stop)
+    visited: set = field(default_factory=set) # stations already served this mission
+    overflow: bool = False                    # drop-off zone full: old overflow rule
 
     def busy(self, t: int) -> bool:
         return self.busy_until > t or bool(self.ops)
@@ -76,6 +79,9 @@ class BikeShareEnv(gym.Env):
         night_rate: float = 40.0,
         truck_fixed_cost: float = 100.0,
         fuel_cost_per_km: float = 0.3,
+        # multi-stop missions (off unless both are set)
+        station_zone: np.ndarray | None = None,
+        max_bikes_per_stop: int | None = None,
         # injected data (tests); loaded from disk when None
         stations: pd.DataFrame | None = None,
         trips: TripEvents | None = None,
@@ -147,6 +153,18 @@ class BikeShareEnv(gym.Env):
 
         # Missions touching these stations are no-ops; leftovers never go there.
         self.truck_blocked = np.isin(self.station_ids, truck_blocked_stations)
+
+        # Multi-stop missions: pick up / drop off at most `max_bikes_per_stop` per
+        # station, moving on to the next station of the same zone (see _run_ops).
+        self.multi_stop = station_zone is not None and max_bikes_per_stop is not None
+        self.max_bikes_per_stop = int(max_bikes_per_stop) if self.multi_stop else None
+        self.station_zone = None
+        if self.multi_stop:
+            self.station_zone = np.asarray(station_zone, dtype=np.int64)
+            if self.station_zone.shape != (self.n_stations,):
+                raise ValueError("station_zone needs one zone id per station")
+            self._zone_members = {int(z): np.flatnonzero((self.station_zone == z) & ~self.truck_blocked)
+                                  for z in np.unique(self.station_zone)}
 
         self.shift_cost = sum(self._hourly_rate(h) for h in range(*shift))
 
@@ -286,6 +304,7 @@ class BikeShareEnv(gym.Env):
             if a == b or self.truck_blocked[a] or self.truck_blocked[b]:
                 continue
             tk.pending_qty = min(qty, self.truck_capacity)
+            tk.collected, tk.visited, tk.overflow = 0, set(), False
             tk.ops = deque([("drive", a), ("load", a), ("drive", b), ("unload", b)])
             self._run_ops(tk, acc)
 
@@ -307,12 +326,45 @@ class BikeShareEnv(gym.Env):
                 tk.location = st
                 tk.busy_until = t + dur
             elif kind == "load":
-                n = int(min(tk.pending_qty, self.bikes[st], self.truck_capacity - tk.load))
+                want = tk.pending_qty - tk.collected if self.multi_stop else tk.pending_qty
+                if self.multi_stop:
+                    want = min(want, self.max_bikes_per_stop)
+                n = int(max(0, min(want, self.bikes[st], self.truck_capacity - tk.load)))
                 self.bikes[st] -= n
                 tk.load += n
+                tk.collected += n
                 tk.busy_until = t + math.ceil(n * self.load_min_per_bike)
+                if self.multi_stop:
+                    tk.visited.add(st)
+                    nxt = None
+                    if tk.collected < tk.pending_qty and tk.load < self.truck_capacity:
+                        nxt = self._next_stop(st, tk.visited, pickup=True)
+                    if nxt is not None:
+                        tk.ops.extendleft([("load", nxt), ("drive", nxt)])
+                    elif tk.load == 0:
+                        tk.ops.clear()        # nothing collected: don't drive to B empty
+                    else:
+                        tk.visited = set()    # drop-off phase starts
             elif kind == "unload":
-                n = int(min(tk.load, self.capacity[st] - self.bikes[st]))
+                cap = self.capacity[st] - self.bikes[st]
+                if self.multi_stop and not tk.overflow and st not in tk.visited:
+                    n = int(min(tk.load, cap, self.max_bikes_per_stop))
+                    tk.visited.add(st)
+                    self.bikes[st] += n
+                    tk.load -= n
+                    acc["bikes_moved"] += n
+                    tk.busy_until = t + math.ceil(n * self.load_min_per_bike)
+                    if tk.load > 0:
+                        nxt = self._next_stop(st, tk.visited, pickup=False)
+                        if nxt is not None:
+                            tk.ops.extend([("drive", nxt), ("unload", nxt)])
+                        else:             # zone B is full: old overflow rule, no cap
+                            tk.overflow = True
+                            dest = self._nearest_free(st, trucks_only=True)
+                            if dest is not None:
+                                tk.ops.extend([("drive", dest), ("unload", dest)])
+                    continue
+                n = int(min(tk.load, cap))
                 self.bikes[st] += n
                 tk.load -= n
                 acc["bikes_moved"] += n
@@ -322,6 +374,18 @@ class BikeShareEnv(gym.Env):
                     dest = self._nearest_free(st, trucks_only=True)
                     if dest is not None:
                         tk.ops.extend([("drive", dest), ("unload", dest)])
+
+    def _next_stop(self, st: int, visited: set, pickup: bool) -> int | None:
+        """Next multi-stop station in `st`'s zone: the unvisited one with the most
+        bikes (pickup) or the most free docks (drop-off); None if none qualifies."""
+        cand = self._zone_members[int(self.station_zone[st])]
+        if visited:
+            cand = cand[~np.isin(cand, list(visited))]
+        if not len(cand):
+            return None
+        score = self.bikes[cand] if pickup else self.capacity[cand] - self.bikes[cand]
+        j = int(np.argmax(score))
+        return int(cand[j]) if score[j] > 0 else None
 
     # ── observation / info ───────────────────────────────────────────────────
     def _obs(self) -> dict:

@@ -11,6 +11,11 @@ class Policy:
     number_trucks = 2   # fleet the policy is run with (hired every day, used or not)
     env_overrides: dict = {}   # extra env settings the policy needs (e.g. truck_capacity)
 
+    @classmethod
+    def env_kwargs(cls) -> dict:
+        """Env settings this policy runs with (override for computed settings)."""
+        return dict(cls.env_overrides)
+
     def reset(self, env) -> None:
         """Called once after env.reset(); `env` is the unwrapped BikeShareEnv."""
         self.number_trucks = env.number_trucks

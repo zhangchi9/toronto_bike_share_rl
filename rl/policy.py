@@ -15,7 +15,7 @@ import numpy as np
 from bikeshare_env.policies import POLICIES, Policy
 from rl.features import TRUCK_CAPACITY, FeatureBuilder, encode_action
 from rl.train import model_dir
-from rl.wrapper import static_data
+from rl.wrapper import multi_stop_kwargs, static_data
 
 ALGOS = {"ppo": "PPO", "a2c": "A2C", "dqn": "DQN"}
 
@@ -23,6 +23,14 @@ ALGOS = {"ppo": "PPO", "a2c": "A2C", "dqn": "DQN"}
 class ZoneActionPolicy(Policy):
     """Asks `choose(obs_vector)` for every idle truck each minute, like RebalanceEnv."""
     env_overrides = {"truck_capacity": TRUCK_CAPACITY}   # same trucks as in training
+    multi_stop = True       # round-3 rule: <= 5 bikes per station, several stops per zone
+
+    @classmethod
+    def env_kwargs(cls) -> dict:
+        kw = super().env_kwargs()
+        if cls.multi_stop:
+            kw.update(multi_stop_kwargs())
+        return kw
 
     def reset(self, env) -> None:
         super().reset(env)
@@ -68,6 +76,7 @@ class FixShuttlePolicy(ZoneActionPolicy):
     Sherbourne, Annex), with every idle truck, at any hour. No learning."""
     label = "Fixed shuttle (1 truck)"
     number_trucks = 1
+    multi_stop = False      # keeps the single pickup / single drop-off station rule
     source_zone, dest_zone, qty = 12, 11, 10
 
     @classmethod

@@ -1,10 +1,13 @@
 """Test every policy on one continuous run, Aug 1 -> Sep 20, 2026.
 
-    python -m rl.evaluate
+    python -m rl.evaluate [--out results/round3]
 
-Writes results/rl_test_results.{md,csv} and results/rl_test_daily.png (test
+Writes <out>/rl_test_results.{md,csv} and <out>/rl_test_daily.png (test
 curve + validation learning curves). Rewards are the env's true $ reward.
+The RL / random policies run with multi-stop missions; the fixed shuttle keeps
+its single pickup / drop-off station rule.
 """
+import argparse
 import os
 import time
 
@@ -49,10 +52,11 @@ def run_no_trucks():
     return _summary("No trucks (benchmark)", 0, env.totals, rewards, time.time() - t0)
 
 
-def run_wrapped(name, trucks, choose):
+def run_wrapped(name, trucks, choose, multi_stop=True):
     """`choose(obs, env) -> discrete action` for each decision."""
     t0 = time.time()
-    env = RebalanceEnv(number_trucks=trucks, windows=[TEST_PERIOD], record_minutes=True)
+    env = RebalanceEnv(number_trucks=trucks, windows=[TEST_PERIOD], record_minutes=True,
+                       multi_stop=multi_stop)
     obs, _ = env.reset(seed=0)
     done = False
     while not done:
@@ -98,10 +102,15 @@ def learning_curves(ax):
 
 
 def main():
+    global OUT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=OUT, help="output folder (default: results)")
+    OUT = ap.parse_args().out
     os.makedirs(OUT, exist_ok=True)
     rows = []
     for name, k, choose in policies_to_run():
-        r = run_no_trucks() if choose is None else run_wrapped(name, k, choose)
+        r = run_no_trucks() if choose is None else run_wrapped(
+            name, k, choose, multi_stop=(name != "fix_shuttle_policy"))
         rows.append(r)
         print(f"  {name:22s} trucks={k}  reward ${r['total_reward']:,.0f}  ({r['seconds']:.0f}s)")
 

@@ -221,6 +221,7 @@ Every parameter can be passed to `gym.make("BikeShareToronto-v0", ...)`.
 | `day_rate`, `night_rate` | `20.0`, `40.0` | Labor $ per hour per truck |
 | `truck_fixed_cost` | `100.0` | $ per truck per day |
 | `fuel_cost_per_km` | `0.3` | $ per road km |
+| `station_zone`, `max_bikes_per_stop` | `None`, `None` | **Multi-stop missions**, on only when both are set. `station_zone` = one zone id per station index. The truck picks up at most `max_bikes_per_stop` bikes at `pickup`, then moves on to the unvisited station in the same zone with the most bikes, until it has `qty` bikes or the zone has none left (if it collected none, the mission ends there). It then drops at most `max_bikes_per_stop` at `dropoff`, then at the unvisited station in that zone with the most free docks, until empty. If the drop-off zone fills up, the rest go to the nearest free docks with no per-stop limit. Used by the RL agents from round 3 (5 bikes per stop) |
 | `stations`, `trips`, `road_dist_km`, `road_time_min` | `None` | Inject your own data instead of loading from `data/` (used by the unit tests) |
 
 ---

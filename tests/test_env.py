@@ -170,3 +170,82 @@ def test_episode_length_and_termination():
 def test_gymnasium_env_checker(number_trucks):
     check_env(make_env(trips=[(0, 5, 0, 1, 5)], number_trucks=number_trucks),
               skip_render_check=True)
+
+
+# ── multi-stop missions (round 3 rule) ──────────────────────────────────────────
+# 6 stations on a line, zone 0 = stations 0-2, zone 1 = stations 3-5.
+POS6 = np.arange(6)
+DIST6 = np.abs(POS6[:, None] - POS6[None, :]).astype(float)
+
+
+def make_multi_env(bikes, capacity=(10,) * 6, max_per_stop=5):
+    stations = pd.DataFrame({
+        "station_id": list(range(200, 206)),
+        "lat": [43.65 + 0.01 * i for i in range(6)], "lon": [-79.38] * 6,
+        "capacity": list(capacity),
+    })
+    events = TripEvents.from_frame(pd.DataFrame(
+        [], columns=["start_min", "end_min", "start_idx", "end_idx", "rent_min"]))
+    env = BikeShareEnv(init_occupancy=0.0, simulation_period=("2026-06-15", "2026-06-15"),
+                       stations=stations, trips=events, road_dist_km=DIST6,
+                       road_time_min=2 * DIST6, depot_station=200, number_trucks=1,
+                       skip_when_all_busy=False, truck_capacity=40,
+                       station_zone=np.array([0, 0, 0, 1, 1, 1]),
+                       max_bikes_per_stop=max_per_stop)
+    env.reset(seed=0)
+    env.bikes[:] = bikes
+    return env
+
+
+def run_mission(env, pickup, dropoff, qty, minutes=200):
+    """Dispatch one mission; return the stations visited (in order) and per-stop changes."""
+    visits, prev = [], env.trucks[0].location
+    before = env.bikes.copy()
+    env.step(np.array([[pickup + 1, dropoff, qty]]))
+    for _ in range(minutes):
+        tk = env.trucks[0]
+        if tk.location != prev:
+            visits.append(tk.location)
+            prev = tk.location
+        if not tk.busy(env.t):
+            break
+        env.step(np.zeros((1, 3), dtype=np.int64))
+    return visits, env.bikes - before
+
+
+def test_multi_stop_picks_at_most_5_per_station_in_most_bikes_order():
+    env = make_multi_env([8, 6, 3, 0, 1, 2])
+    visits, delta = run_mission(env, pickup=0, dropoff=3, qty=12)
+    # Pickup: 5 at 0, 5 at 1 (next most bikes), 2 at 2 (ordered amount reached).
+    # Drop-off: 5 at 3, then most free docks: 4 (9 free) gets 5, then 5 gets 2.
+    assert visits == [1, 2, 3, 4, 5]
+    assert delta.tolist() == [-5, -5, -2, 5, 5, 2]
+    assert env.totals["bikes_moved"] == 12 and env.trucks[0].load == 0
+    assert np.abs(delta).max() <= 5
+
+
+def test_multi_stop_stops_when_zone_runs_dry():
+    env = make_multi_env([2, 1, 0, 0, 0, 0])
+    _, delta = run_mission(env, pickup=0, dropoff=3, qty=40)
+    assert delta.tolist() == [-2, -1, 0, 3, 0, 0]       # 3 collected, all fit at the first drop
+    assert env.totals["bikes_moved"] == 3
+
+
+def test_multi_stop_collecting_nothing_skips_the_drive_to_dropoff():
+    env = make_multi_env([0, 0, 0, 0, 0, 0])
+    visits, delta = run_mission(env, pickup=1, dropoff=4, qty=10)
+    assert visits == [1]                                 # never drove to zone 1
+    assert not delta.any() and env.totals["truck_km"] == pytest.approx(1.0)
+
+
+def test_multi_stop_full_dropoff_zone_falls_back_to_nearest_free():
+    env = make_multi_env([8, 6, 3, 1, 1, 1], capacity=(10, 10, 10, 2, 2, 2))
+    _, delta = run_mission(env, pickup=0, dropoff=3, qty=10)
+    # 1 free dock at each of 3, 4, 5; the other 7 go to the nearest free dock (station 2).
+    assert delta.tolist() == [-5, -5, 7, 1, 1, 1]
+    assert env.trucks[0].load == 0 and env.totals["bikes_moved"] == 10
+
+
+def test_multi_stop_needs_both_settings():
+    env = make_env(number_trucks=1, station_zone=np.zeros(4, dtype=int))
+    assert not env.multi_stop

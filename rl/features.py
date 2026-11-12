@@ -19,6 +19,7 @@ from rl.zones import Zones
 
 QTY_LEVELS = (10, 20, 40)
 TRUCK_CAPACITY = 40          # bikes per truck for the RL / zone policies
+MAX_BIKES_PER_STOP = 5       # multi-stop missions (round 3): bikes per station visit
 HISTORY_MIN = 60
 NET_CHANGE_SCALE = 10.0
 
@@ -108,5 +109,8 @@ class FeatureBuilder:
         cand = cand[free > 0]
         if not len(cand):
             return np.zeros(3, dtype=np.int64)
-        dropoff = int(cand[np.argmin(env.bikes[cand] / env.capacity[cand])])
+        if getattr(env, "multi_stop", False):     # most free docks (multi-stop rule)
+            dropoff = int(cand[np.argmax(env.capacity[cand] - env.bikes[cand])])
+        else:                                     # lowest fill ratio (single stop)
+            dropoff = int(cand[np.argmin(env.bikes[cand] / env.capacity[cand])])
         return np.array([pickup + 1, dropoff, q], dtype=np.int64)

@@ -127,7 +127,7 @@ def test_fix_shuttle_policy_same_on_dashboard_and_in_eval():
     from rl.policy import FixShuttlePolicy
 
     r = simulate_day("2026-07-18", "fix_shuttle_policy")
-    env = RebalanceEnv(number_trucks=1, windows=WINDOW)
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, multi_stop=False)   # single-stop rule
     env.reset(seed=0)
     zof, a, done = env.zones.zone_of_station, FixShuttlePolicy.action(), False
     while not done:
@@ -137,3 +137,39 @@ def test_fix_shuttle_policy_same_on_dashboard_and_in_eval():
         _, _, done, _, info = env.step(a)
     assert r.reward.sum() == pytest.approx(info["true_total"])
     assert env.env.totals["bikes_moved"] > 0
+
+
+def test_multi_stop_is_on_for_agents_and_first_dropoff_has_most_free_docks(env):
+    from rl.features import MAX_BIKES_PER_STOP
+    u = env.env
+    assert u.multi_stop and u.max_bikes_per_stop == MAX_BIKES_PER_STOP == 5
+    rng = np.random.default_rng(2)
+    for a in rng.integers(1, env.action_space.n, 300):
+        row = env.fb.decode(a)
+        if not row.any():
+            continue
+        zone = env.zones.zone_of_station[row[1]]
+        members = env.fb.truck_stations[zone]
+        assert u.capacity[row[1]] - u.bikes[row[1]] == (u.capacity[members] - u.bikes[members]).max()
+
+
+def test_agent_missions_move_at_most_5_bikes_per_stop(env):
+    u = env.env
+    a = next(a for a in range(1, env.action_space.n)
+             if env.fb.decode(a).any() and env.fb.decode(a)[2] == 40)
+    k = env.queue[0]
+    loads, real_step = [u.trucks[k].load], u.step
+
+    def recording_step(action):            # the wrapper simulates whole missions inside step()
+        out = real_step(action)
+        loads.append(u.trucks[k].load)
+        return out
+    u.step = recording_step
+    env.step(a)                            # with 2 trucks the order waits for the other one
+    for _ in range(3000):
+        if len(loads) > 1 and not u.trucks[k].busy(u.t):
+            break
+        env.step(0)
+    assert u.trucks[k].load == 0 and len(loads) > 1
+    assert np.abs(np.diff(loads)).max() <= 5            # each stop handles at most 5 bikes
+    assert max(loads) > 5                               # so it took several pickup stops
