@@ -45,6 +45,9 @@ class _Truck:
     collected: int = 0                        # bikes picked up this mission (multi-stop)
     visited: set = field(default_factory=set) # stations already served this mission
     overflow: bool = False                    # drop-off zone full: old overflow rule
+    lane: int = 0                             # paired mode: 0 serves ranks 1,3,5..; 1 serves 2,4,6..
+    route: deque | None = None                # paired mode: stations left to try in this zone
+    pair: dict | None = None                  # paired mode: state shared by the two trucks
 
     def busy(self, t: int) -> bool:
         return self.busy_until > t or bool(self.ops)
@@ -82,6 +85,8 @@ class BikeShareEnv(gym.Env):
         # multi-stop missions (off unless both are set)
         station_zone: np.ndarray | None = None,
         max_bikes_per_stop: int | None = None,
+        # two trucks run every order together, splitting the zone's ranked stations
+        paired_trucks: bool = False,
         # injected data (tests); loaded from disk when None
         stations: pd.DataFrame | None = None,
         trips: TripEvents | None = None,
@@ -165,6 +170,11 @@ class BikeShareEnv(gym.Env):
                 raise ValueError("station_zone needs one zone id per station")
             self._zone_members = {int(z): np.flatnonzero((self.station_zone == z) & ~self.truck_blocked)
                                   for z in np.unique(self.station_zone)}
+        # Paired trucks: row 0 of the action is one order run by both trucks (see
+        # _dispatch_pair); needs multi-stop missions and exactly 2 trucks.
+        self.paired_trucks = bool(paired_trucks)
+        if self.paired_trucks and (not self.multi_stop or self.number_trucks != 2):
+            raise ValueError("paired_trucks needs multi-stop missions and number_trucks=2")
 
         self.shift_cost = sum(self._hourly_rate(h) for h in range(*shift))
 
@@ -296,6 +306,9 @@ class BikeShareEnv(gym.Env):
     # ── trucks ───────────────────────────────────────────────────────────────
     def _dispatch(self, action: np.ndarray, acc: dict) -> None:
         """Start missions for idle trucks. Busy trucks ignore their row."""
+        if self.paired_trucks:
+            self._dispatch_pair(action[0], acc)
+            return
         for tk, (pickup, dropoff, qty) in zip(self.trucks, action):
             pickup, dropoff, qty = int(pickup), int(dropoff), int(qty)
             if tk.busy(self.t) or pickup == 0 or qty == 0:
@@ -305,8 +318,49 @@ class BikeShareEnv(gym.Env):
                 continue
             tk.pending_qty = min(qty, self.truck_capacity)
             tk.collected, tk.visited, tk.overflow = 0, set(), False
+            tk.route = tk.pair = None
             tk.ops = deque([("drive", a), ("load", a), ("drive", b), ("unload", b)])
             self._run_ops(tk, acc)
+
+    def _dispatch_pair(self, row: np.ndarray, acc: dict) -> None:
+        """Paired trucks: both trucks take the same order (pickup zone -> drop-off
+        zone, qty bikes each) once both are idle. The pickup zone's stations are
+        ranked by bikes, `pickup` first; truck 0 serves ranks 1, 3, 5, ... and
+        truck 1 ranks 2, 4, 6, ..., at most `max_bikes_per_stop` per station. The
+        drop-off zone is ranked the same way (most free docks, `dropoff` first)
+        when the first truck has finished collecting."""
+        pickup, dropoff, qty = (int(v) for v in row)
+        if pickup == 0 or qty == 0 or any(tk.busy(self.t) for tk in self.trucks):
+            return
+        a, b = pickup - 1, dropoff
+        if a == b or self.truck_blocked[a] or self.truck_blocked[b]:
+            return
+        ranked = [a] + [s for s in self._ranked(a, pickup=True) if s != a]
+        pair = {"dropoff": b, "drop_ranked": None}
+        for lane, tk in enumerate(self.trucks):
+            tk.pending_qty = min(qty, self.truck_capacity)
+            tk.collected, tk.visited, tk.overflow = 0, set(), False
+            tk.lane, tk.pair = lane, pair
+            tk.route = deque(ranked[lane::2])
+            first = self._next_on_route(tk, pickup=True)
+            tk.ops = deque([("drive", first), ("load", first)] if first is not None else [])
+            self._run_ops(tk, acc)
+
+    def _ranked(self, st: int, pickup: bool) -> list[int]:
+        """Stations of `st`'s zone with bikes (pickup) or free docks (drop-off),
+        most first."""
+        cand = self._zone_members[int(self.station_zone[st])]
+        score = self.bikes[cand] if pickup else self.capacity[cand] - self.bikes[cand]
+        order = np.argsort(-score, kind="stable")
+        return [int(s) for s in cand[order][score[order] > 0]]
+
+    def _next_on_route(self, tk: _Truck, pickup: bool) -> int | None:
+        """Pop the truck's next station that still has bikes / free docks."""
+        while tk.route:
+            st = tk.route.popleft()
+            if (self.bikes[st] > 0) if pickup else (self.bikes[st] < self.capacity[st]):
+                return st
+        return None
 
     def _advance_trucks(self, acc: dict) -> None:
         for tk in self.trucks:
@@ -334,7 +388,20 @@ class BikeShareEnv(gym.Env):
                 tk.load += n
                 tk.collected += n
                 tk.busy_until = t + math.ceil(n * self.load_min_per_bike)
-                if self.multi_stop:
+                if tk.route is not None:      # paired trucks
+                    nxt = None
+                    if tk.collected < tk.pending_qty and tk.load < self.truck_capacity:
+                        nxt = self._next_on_route(tk, pickup=True)
+                    if nxt is not None:
+                        tk.ops.extendleft([("load", nxt), ("drive", nxt)])
+                    elif tk.load > 0:         # drop-off phase on this truck's ranks
+                        if tk.pair["drop_ranked"] is None:
+                            b = tk.pair["dropoff"]
+                            tk.pair["drop_ranked"] = [b] + [
+                                s for s in self._ranked(b, pickup=False) if s != b]
+                        tk.route = deque(tk.pair["drop_ranked"][tk.lane::2])
+                        self._next_dropoff(tk, tk.pair["dropoff"])
+                elif self.multi_stop:
                     tk.visited.add(st)
                     nxt = None
                     if tk.collected < tk.pending_qty and tk.load < self.truck_capacity:
@@ -347,6 +414,15 @@ class BikeShareEnv(gym.Env):
                         tk.visited = set()    # drop-off phase starts
             elif kind == "unload":
                 cap = self.capacity[st] - self.bikes[st]
+                if tk.route is not None and not tk.overflow:     # paired trucks
+                    n = int(min(tk.load, cap, self.max_bikes_per_stop))
+                    self.bikes[st] += n
+                    tk.load -= n
+                    acc["bikes_moved"] += n
+                    tk.busy_until = t + math.ceil(n * self.load_min_per_bike)
+                    if tk.load > 0:
+                        self._next_dropoff(tk, st)
+                    continue
                 if self.multi_stop and not tk.overflow and st not in tk.visited:
                     n = int(min(tk.load, cap, self.max_bikes_per_stop))
                     tk.visited.add(st)
@@ -374,6 +450,18 @@ class BikeShareEnv(gym.Env):
                     dest = self._nearest_free(st, trucks_only=True)
                     if dest is not None:
                         tk.ops.extend([("drive", dest), ("unload", dest)])
+
+    def _next_dropoff(self, tk: _Truck, st: int) -> None:
+        """Paired trucks: queue the next drop-off on the truck's ranks; when they
+        run out, the rest go to the free dock nearest `st` (no per-stop limit)."""
+        nxt = self._next_on_route(tk, pickup=False)
+        if nxt is not None:
+            tk.ops.extend([("drive", nxt), ("unload", nxt)])
+            return
+        tk.overflow = True
+        dest = self._nearest_free(st, trucks_only=True)
+        if dest is not None:
+            tk.ops.extend([("drive", dest), ("unload", dest)])
 
     def _next_stop(self, st: int, visited: set, pickup: bool) -> int | None:
         """Next multi-stop station in `st`'s zone: the unvisited one with the most

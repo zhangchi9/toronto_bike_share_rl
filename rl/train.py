@@ -32,14 +32,18 @@ def _make_env(trucks: int, seed: int):
     return thunk
 
 
-def build_model(algo: str, trucks: int, seed: int, n_envs: int):
+EXPLORATION_STEPS = 200_000   # DQN: epsilon decays 1 -> 0.02 over this many decisions
+
+
+def build_model(algo: str, trucks: int, seed: int, n_envs: int, timesteps: int = 1_000_000):
     common = dict(policy="MlpPolicy", gamma=GAMMA, policy_kwargs=POLICY_KWARGS,
                   seed=seed, device="cpu", verbose=0, tensorboard_log="runs")
     if algo == "dqn":
         venv = DummyVecEnv([_make_env(trucks, seed)])
         return DQN(env=venv, buffer_size=200_000, learning_starts=20_000,
                    batch_size=256, learning_rate=1e-4, train_freq=4,
-                   target_update_interval=10_000, exploration_fraction=0.2,
+                   target_update_interval=10_000,
+                   exploration_fraction=min(1.0, EXPLORATION_STEPS / timesteps),
                    exploration_final_eps=0.02, **common)
     venv = SubprocVecEnv([_make_env(trucks, seed + i) for i in range(n_envs)])
     if algo == "ppo":
@@ -57,12 +61,13 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-envs", type=int, default=8, help="parallel envs (PPO/A2C)")
     p.add_argument("--eval-every", type=int, default=50_000, help="decisions")
+    p.add_argument("--out", default=None, help="model folder (default models/<algo>_<k>trucks)")
     args = p.parse_args()
 
     torch.set_num_threads(2)
-    out = model_dir(args.algo, args.trucks)
+    out = args.out or model_dir(args.algo, args.trucks)
     os.makedirs(out, exist_ok=True)
-    model = build_model(args.algo, args.trucks, args.seed, args.n_envs)
+    model = build_model(args.algo, args.trucks, args.seed, args.n_envs, args.timesteps)
     n_envs = model.get_env().num_envs
 
     eval_env = Monitor(RebalanceEnv(number_trucks=args.trucks, windows=VAL_WINDOWS))
@@ -70,7 +75,7 @@ def main():
                             eval_freq=max(1, args.eval_every // n_envs),
                             best_model_save_path=out, log_path=out, verbose=1)
     model.learn(total_timesteps=args.timesteps, callback=callback,
-                tb_log_name=f"{args.algo}_{args.trucks}trucks", progress_bar=False)
+                tb_log_name=os.path.basename(os.path.normpath(out)), progress_bar=False)
     model.save(os.path.join(out, "final_model"))
     if not os.path.exists(os.path.join(out, "best_model.zip")):
         model.save(os.path.join(out, "best_model"))   # very short runs: no eval yet

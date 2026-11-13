@@ -19,7 +19,8 @@ def env(request):
 def test_spaces_sizes(env):
     assert QTY_LEVELS == (10, 20, 40) and env.env.truck_capacity == 40
     assert env.action_space.n == n_actions(20) == 1 + 20 * 19 * len(QTY_LEVELS) == 1141
-    assert env.observation_space.shape == (obs_size(20, env.K),) == ((110,) if env.K == 1 else (132,))
+    assert env.observation_space.shape == (obs_size(20, env.K),) == ((190,) if env.K == 1 else (212,))
+    assert obs_size(20, env.K, forecast=False) == (110 if env.K == 1 else 132)   # rounds 1-3
 
 
 def test_wait_only_training_reward_is_zero_and_true_reward_reconstructs(env):
@@ -173,3 +174,44 @@ def test_agent_missions_move_at_most_5_bikes_per_stop(env):
     assert u.trucks[k].load == 0 and len(loads) > 1
     assert np.abs(np.diff(loads)).max() <= 5            # each stop handles at most 5 bikes
     assert max(loads) > 5                               # so it took several pickup stops
+
+
+def test_duplicated_dqn_runs_both_trucks_on_every_order():
+    import rl.policy as rp
+    from bikeshare_env.rollout import simulate_day
+    if "dqn_duplicated_2trucks" not in rp.POLICIES:
+        pytest.skip("models/dqn_1trucks/best_model.zip not trained")
+    r = simulate_day("2026-07-18", "dqn_duplicated_2trucks")
+    assert r.totals["bikes_moved"] > 0
+    assert set(r.truck_legs[:, 0].tolist()) == {0, 1}      # both trucks drove
+
+
+def test_forecast_block_is_the_table_entry_for_the_current_slot(env):
+    from rl import forecast as fc
+    fb, u, Z = env.fb, env.env, 20
+    for _ in range(40):                          # move into the day a bit
+        env.step(0)
+    obs = fb.obs(env.queue[0])
+    slot = ((u.start_date - fc.DATA_START).days * 1440 + u.t) // fc.SLOT_MIN
+    want = np.clip(fb.fc_table[slot] / fb.zone_cap[:, None], 0, 1).T.reshape(-1)
+    assert np.allclose(obs[4 * Z: 8 * Z], want)
+    assert u.start_date == fc.DATA_START + __import__("pandas").Timedelta(days=slot * 15 // 1440)
+
+
+def test_forecast_features_use_only_trips_before_the_origin():
+    from rl import forecast as fc
+    rng = np.random.default_rng(0)
+    n_min, Z = 20 * 1440, 3
+    counts = rng.poisson(0.3, (n_min, Z))
+    cum = lambda c: np.vstack([np.zeros((1, Z), np.int64), np.cumsum(c, axis=0)])
+    origins = np.array([9 * 1440 + 600, 12 * 1440])
+    for H in fc.HORIZONS:
+        X = fc.features(cum(counts), cum(counts[::-1]), origins, H)
+        for m in origins:                        # change every trip at or after m
+            later = counts.copy()
+            later[m:] = rng.poisson(5.0, later[m:].shape)
+            X2 = fc.features(cum(later), cum(counts[::-1]), [m], H)
+            row = np.flatnonzero(origins == m)[0]
+            assert np.array_equal(X[row * Z:(row + 1) * Z], X2)
+        y = fc.targets(cum(counts), origins, H)  # target = the next H minutes
+        assert y[0] == counts[origins[0]:origins[0] + H, 0].sum()

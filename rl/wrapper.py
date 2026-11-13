@@ -51,7 +51,7 @@ def multi_stop_kwargs() -> dict:
 
 
 def make_base_env(window, number_trucks, init_occupancy, trips=None,
-                  multi_stop: bool = True) -> BikeShareEnv:
+                  multi_stop: bool = True, paired_trucks: bool = False) -> BikeShareEnv:
     s = static_data()
     if trips is None:
         trips = load_period_trips(window[0], window[1], s["ids"])
@@ -59,6 +59,7 @@ def make_base_env(window, number_trucks, init_occupancy, trips=None,
                         number_trucks=number_trucks, skip_when_all_busy=False,
                         truck_capacity=TRUCK_CAPACITY,
                         **(multi_stop_kwargs() if multi_stop else {}),
+                        paired_trucks=paired_trucks,
                         stations=s["stations"], trips=trips,
                         road_dist_km=s["dist"], road_time_min=s["time"])
 
@@ -84,7 +85,8 @@ class RebalanceEnv(gym.Env):
                  episode_days: int = EPISODE_DAYS,
                  init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
                  reward_scale: float = 10.0, n_zones: int = N_ZONES,
-                 record_minutes: bool = False, multi_stop: bool = True):
+                 record_minutes: bool = False, multi_stop: bool = True,
+                 forecast: bool = True):
         """`windows`: fixed list of (start, end) episodes, used in order (eval/test).
         Otherwise each episode is a random `episode_days` window in `sample_range`."""
         super().__init__()
@@ -98,11 +100,12 @@ class RebalanceEnv(gym.Env):
         self.reward_scale = reward_scale
         self.record_minutes = record_minutes   # keep each minute's true reward (eval)
         self.multi_stop = multi_stop           # round-3 multi-stop missions (5 bikes/stop)
+        self.forecast = forecast               # round-4 demand forecast features
         self.zones = static_data(n_zones)["zones"]
         self._next_window = 0
 
         self.action_space = spaces.Discrete(n_actions(n_zones))
-        self.observation_space = spaces.Box(-1.0, 1.0, (obs_size(n_zones, self.K),), np.float32)
+        self.observation_space = spaces.Box(-1.0, 1.0, (obs_size(n_zones, self.K, forecast),), np.float32)
         self.env: BikeShareEnv | None = None
 
     # ── episode setup ────────────────────────────────────────────────────────
@@ -126,7 +129,7 @@ class RebalanceEnv(gym.Env):
         self.env.reset(seed=0)
         self.base = no_truck_rewards(self.window, self.init_occupancy, trips)
         self.fleet_daily = self.K * (self.env.truck_fixed_cost + self.env.shift_cost)
-        self.fb = FeatureBuilder(self.env, self.zones)
+        self.fb = FeatureBuilder(self.env, self.zones, forecast=self.forecast)
         self.fb.reset()
         self.true_total = 0.0
         self.minute_rewards: list[float] = []

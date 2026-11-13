@@ -1,37 +1,33 @@
 """
-Bike Share Toronto — simulated day viewer
-Runs the BikeShareToronto-v0 env for the chosen date + rebalancing policy, then
-animates the recorded day: station fill levels, active rides and live metrics.
+Bike Share Toronto — simulation replay viewer
+Replays one continuous simulated run per rebalancing policy, Aug 1 - Sep 30, 2026
+(stations filled once at 00:00 on Aug 1; bikes carry over between days). Pick any
+date range in that period and a policy: station fill levels, active rides, trucks
+and live metrics are animated minute by minute through the range.
 Usage:
     python fetch_stations.py         # once
     python preprocess.py             # once
     python build_road_distances.py   # once
+    python -m dashboard_data         # once, and after retraining (about 2 min)
     python app.py                    # http://localhost:8050
 """
-import base64
-from functools import lru_cache
+import threading
 
-from dash import Dash, dcc, html, Input, Output, State, no_update
+import pandas as pd
+from dash import Dash, ctx, dcc, html, Input, Output, State, no_update
 
-from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY
+import dashboard_data as dd           # also adds the trained RL models to POLICIES
+from bikeshare_env.env import MINUTES_PER_DAY
 from bikeshare_env.policies import POLICIES
-from bikeshare_env.rollout import simulate_day
 from data_loader import load_stations
-
-try:   # adds trained RL models (models/*/best_model.zip) to the Policy dropdown
-    import rl.policy  # noqa: F401
-except ImportError as e:
-    print(f"RL policies not loaded: {e}")
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 STATIONS_DF = load_stations()
 
 TORONTO_CENTER = {"lat": 43.655, "lon": -79.38}
-MIN_DATE = "2026-01-01"
-MAX_DATE = "2026-09-30"
-DEFAULT_DATE = "2026-06-15"
+MIN_DATE, MAX_DATE = dd.REPLAY_START, dd.REPLAY_END    # other dates are greyed out
+DEFAULT_RANGE = ("2026-08-01", "2026-08-07")
 DEFAULT_POLICY = "no_rebalancing"
-INIT_OCCUPANCY = DEFAULT_INIT_OCCUPANCY
 
 # RL zones (rl/zones.py) drawn as an optional overlay: outline + centre label.
 try:
@@ -51,46 +47,41 @@ _STATION_STORE = {
 }
 
 
-def trucks_payload(r) -> dict | None:
-    """Truck trips (with their road route) and per-minute truck state."""
-    K = r.truck_status.shape[1]
-    if K == 0:
-        return None
-    from road_routes import get_router
-    router = get_router()
-    legs = []
-    for k, a, b, depart, arrive, load in r.truck_legs.tolist():
-        lat, lon = router.route(a, b)
-        legs.append({"k": k, "depart": depart, "arrive": arrive, "load": load,
-                     "to": b, "lat": list(lat), "lon": list(lon)})
-    return {"n": K, "legs": legs,
-            "status": r.truck_status.T.tolist(), "load": r.truck_load.T.tolist(),
-            "station": r.truck_station.T.tolist(), "moved": r.truck_moved.tolist()}
+def _day(date_str: str) -> int:
+    """Replay day index (0 = Aug 1) of a date picker value."""
+    return (pd.Timestamp(date_str).normalize() - pd.Timestamp(dd.REPLAY_START)).days
 
 
-@lru_cache(maxsize=12)
-def get_simulation(date_str: str, policy: str) -> dict:
-    """Simulate one day and serialize it for the browser (~3 MB)."""
-    r = simulate_day(date_str, policy, init_occupancy=INIT_OCCUPANCY)
-    t = r.trips
-    return {
-        "key": f"{date_str}|{policy}",
-        # (1440 x N) uint8 bike counts, row-major, base64 to keep JSON small
-        "bikes": base64.b64encode(r.bikes.tobytes()).decode("ascii"),
-        "reward": r.reward.round(2).tolist(),
-        "fulfilled": r.fulfilled.tolist(),
-        "lost": r.lost.tolist(),
-        "active": r.active.tolist(),
-        "blocked": r.blocked.tolist(),
-        "pending": r.pending.tolist(),
-        "trips": {
-            "sm": t.start_min.tolist(), "em": t.end_min.tolist(),
-            "s": t.start_idx.tolist(), "e": t.end_idx.tolist(),
-            "casual": t.casual.tolist(), "ok": r.trip_started.astype(int).tolist(),
-        },
-        "n_requests": len(t),
-        "trucks": trucks_payload(r),
-    }
+def _label(d: int, weekday: bool = False) -> str:
+    date = dd.day_date(d)
+    return (f"{date:%a} " if weekday else "") + f"{date:%b} {date.day}"
+
+
+# ── Timeline marks: the date at each midnight, then every 3 hours ─────────────
+_HOUR_MARK = {"color": "#777", "fontSize": "11px"}
+_DATE_MARK = {"fontWeight": "bold", "color": "#1a1a2e"}
+PX_PER_DAY = 300          # timeline width per day, so 3-hour labels never overlap
+
+
+def _hour_label(h: int) -> str:
+    return "12pm" if h == 12 else f"{h % 12}{'am' if h < 12 else 'pm'}"
+
+
+def slider_marks(n_days: int, d0: int) -> dict:
+    marks = {}
+    for i in range(n_days):
+        start = i * MINUTES_PER_DAY
+        marks[start] = {"label": _label(d0 + i), "style": _DATE_MARK}
+        for h in range(3, 24, 3):
+            marks[start + h * 60] = {"label": _hour_label(h), "style": _HOUR_MARK}
+    return marks
+
+
+def slider_width(n_days: int) -> dict:
+    """At least the page width; longer ranges scroll sideways."""
+    # Side padding keeps the first date label and the handle at minute 0 unclipped.
+    return {"width": f"max(100%, {n_days * PX_PER_DAY}px)", "padding": "0 28px",
+            "boxSizing": "border-box"}
 
 
 # ── Map figure ────────────────────────────────────────────────────────────────
@@ -168,14 +159,27 @@ function(current_min, show_zones, sim, station_data, layout, zones) {
         current_min === null || current_min === undefined) {
         return Array(__N_OUTPUTS__).fill(nu);
     }
-    var t = Math.max(0, Math.min(1439, current_min));
+    // The slider counts minutes from 00:00 on the first picked day; `sim` holds one
+    // day of the replay (minutes relative to its 00:00). While the next day loads, wait.
+    window._bsRangeStart = sim.start;    // for the slider tooltip (assets/slider_time.js)
+    var t = current_min - sim.day*1440;
+    if (t < 0 || t > 1439) return Array(__N_OUTPUTS__).fill(nu);
+
+    // Long ranges scroll sideways: keep the play head in view.
+    var scroller = document.getElementById('slider-scroll');
+    if (scroller && scroller.scrollWidth > scroller.clientWidth + 1 && sim.n_days) {
+        var pad = 12 + 28, track = scroller.scrollWidth - 2*pad;   // scroller + inner padding
+        var x = pad + track * current_min / Math.max(1, sim.n_days*1440 - 1);
+        var left = scroller.scrollLeft, w = scroller.clientWidth;
+        if (x < left + 60 || x > left + w - 60) scroller.scrollLeft = Math.max(0, x - w*0.25);
+    }
 
     // Decode the (1440 x N) bike matrix and cumulative sums once per simulation.
     if (!window._bsSim || window._bsSim.key !== sim.key) {
         var bin = atob(sim.bikes), u8 = new Uint8Array(bin.length);
         for (var b=0; b<bin.length; b++) u8[b] = bin.charCodeAt(b);
         var cum = {reward:[], fulfilled:[], lost:[], blocked:[]},
-            acc = {reward:0, fulfilled:0, lost:0, blocked:0};
+            acc = Object.assign({}, sim.cum0);   // running totals since the range start
         for (var m=0; m<sim.reward.length; m++) {
             for (var key in acc) { acc[key] += sim[key][m]; cum[key].push(acc[key]); }
         }
@@ -219,7 +223,7 @@ function(current_min, show_zones, sim, station_data, layout, zones) {
 
     var hh=String(Math.floor(t/60)).padStart(2,'0');
     var mm=String(t%60).padStart(2,'0');
-    var timeText=hh+':'+mm;
+    var timeText=sim.date+'  '+hh+':'+mm;
 
     // ── Trucks: position along the road route of the trip in progress ──────────
     function clock(m) {
@@ -399,7 +403,8 @@ def serve_layout():
     layout = map_layout(request.url_root if has_request_context() else "http://localhost:8050/")
     return html.Div(
     [
-        dcc.Store(id="sim-store", data=None),
+        dcc.Store(id="sim-store", data=None),      # the replay day being shown
+        dcc.Store(id="range-store", data=None),    # {policy, d0, n_days} of the picked range
         dcc.Store(id="station-store", data=_STATION_STORE),
         dcc.Store(id="zone-store", data=_ZONE_STORE),
         dcc.Store(id="map-layout", data=layout),
@@ -410,11 +415,13 @@ def serve_layout():
             [
                 html.Span("Bike Share Toronto",
                           style={"fontWeight":"bold","fontSize":"18px","color":"white"}),
-                html.Span("Date:", style={"color":"#ccc","marginLeft":"24px"}),
-                dcc.DatePickerSingle(
-                    id="date-picker",
+                html.Span("Dates:", style={"color":"#ccc","marginLeft":"24px"}),
+                dcc.DatePickerRange(
+                    id="date-range",
                     min_date_allowed=MIN_DATE, max_date_allowed=MAX_DATE,
-                    date=DEFAULT_DATE, display_format="YYYY-MM-DD",
+                    start_date=DEFAULT_RANGE[0], end_date=DEFAULT_RANGE[1],
+                    initial_visible_month=MIN_DATE, minimum_nights=0,
+                    display_format="YYYY-MM-DD",
                 ),
                 html.Span("Policy:", style={"color":"#ccc","marginLeft":"16px"}),
                 dcc.Dropdown(
@@ -436,12 +443,22 @@ def serve_layout():
                     style={"marginLeft":"16px","fontSize":"14px"},
                     labelStyle={"color":"#eeeeee","cursor":"pointer"},
                 ),
-                html.Div(id="time-display", children="00:00",
+                html.Div(id="time-display", children="",
                          style={"color":"#ffff88","marginLeft":"32px",
-                                "fontSize":"15px","fontWeight":"bold"}),
+                                "fontSize":"15px","fontWeight":"bold",
+                                "fontVariantNumeric":"tabular-nums"}),
+                html.Div(
+                    [html.Span("Jump to day:", style={"color":"#ccc","marginRight":"6px"}),
+                     dcc.Dropdown(id="day-select", options=[], value=0, clearable=False,
+                                  searchable=False, style={"width":"140px"})],
+                    id="day-select-wrap",
+                    style={"display":"none","alignItems":"center","marginLeft":"12px"},
+                ),
             ],
-            style={"display":"flex","alignItems":"center","gap":"8px",
-                   "padding":"10px 16px","background":"#1a1a2e"},
+            # Above the map legend, so the calendar and dropdown menus aren't hidden behind it.
+            style={"display":"flex","alignItems":"center","gap":"8px","flexWrap":"wrap",
+                   "padding":"10px 16px","background":"#1a1a2e",
+                   "position":"relative","zIndex":2000},
         ),
 
         # Map container with legend overlay
@@ -532,11 +549,28 @@ def serve_layout():
                     ],
                     style={"display":"flex","alignItems":"center","marginBottom":"8px"},
                 ),
-                dcc.Slider(
-                    id="time-slider", min=0, max=1439, step=1, value=0,
-                    marks={i*60: f"{i:02d}:00" for i in range(0, 25, 2)},
-                    tooltip={"placement":"bottom","always_visible":False},
+                # Every 3 hours is labelled, so a long range is wider than the page: the
+                # timeline scrolls sideways and follows the play head (animation callback).
+                html.Div(
+                    html.Div(
+                        dcc.Slider(
+                            id="time-slider", min=0, max=1439, step=1, value=0,
+                            marks=slider_marks(1, 0),
+                            allow_direct_input=False,   # its box would show raw minutes
+                            # Date and time under the cursor (assets/slider_time.js).
+                            tooltip={"placement": "top", "always_visible": False,
+                                     "transform": "sliderDateTime"},
+                        ),
+                        id="slider-inner", style=slider_width(1),
+                    ),
+                    id="slider-scroll",
+                    style={"overflowX":"auto","overflowY":"hidden",
+                           "padding":"28px 12px 4px"},    # room for the tooltip above
                 ),
+                html.Div("Replay of one continuous simulated run from Aug 1, 2026: stations are "
+                         "filled once at 00:00 on Aug 1 and bikes carry over between days. "
+                         "Running totals count from the start of the picked range.",
+                         style={"fontSize":"12px","color":"#666","marginTop":"6px"}),
             ],
             style={"padding":"10px 20px","background":"#f4f4f4",
                    "borderTop":"1px solid #ddd"},
@@ -551,17 +585,85 @@ app.layout = serve_layout
 
 # ── Server callbacks ───────────────────────────────────────────────────────────
 
+
+
 @app.callback(
     Output("total-trips", "children"),
-    Output("sim-store", "data"),
-    Input("date-picker", "date"),
+    Output("range-store", "data"),
+    Output("time-slider", "max"),
+    Output("time-slider", "marks"),
+    Output("day-select", "options"),
+    Output("day-select-wrap", "style"),
+    Output("slider-inner", "style"),
+    Input("date-range", "start_date"),
+    Input("date-range", "end_date"),
     Input("policy-select", "value"),
+    State("day-select-wrap", "style"),
 )
-def on_simulation_change(date_str, policy):
-    if not date_str or not policy:
+def on_selection_change(start, end, policy, wrap_style):
+    """A new range or policy: load that policy's replay (built first if missing)."""
+    if not start or not end or not policy:
+        return (no_update,) * 7
+    d0, d1 = _day(start), _day(end)
+    if d1 < d0:
+        return ("End date is before the start date",) + (no_update,) * 6
+    dd.load(policy)
+    n = d1 - d0 + 1
+    span = _label(d0) if n == 1 else f"{_label(d0)} – {_label(d1)} ({n} days)"
+    style = dict(wrap_style or {}, display="flex" if n > 1 else "none")
+    return (f"{dd.requests_in(d0, d1):,} bike requests, {span}",
+            {"policy": policy, "d0": d0, "n_days": n},
+            n * MINUTES_PER_DAY - 1, slider_marks(n, d0),
+            [{"label": _label(d0 + i, weekday=True), "value": i} for i in range(n)], style,
+            slider_width(n))
+
+
+@app.callback(
+    Output("time-slider", "value"),
+    Output("day-select", "value"),
+    Input("interval", "n_intervals"),
+    Input("day-select", "value"),
+    Input("time-slider", "value"),
+    Input("range-store", "data"),
+    State("speed-select", "value"),
+    prevent_initial_call=True,
+)
+def set_time(_, day, minute, rng, speed):
+    """Keep the slider (minutes since the range start) and the day picker in step:
+    playing advances the slider, picking a day jumps there at the same time of day,
+    and a new range starts again at 00:00 on its first day."""
+    if not rng:
         return no_update, no_update
-    sim = get_simulation(date_str, policy)
-    return f"{sim['n_requests']:,} bike requests on {date_str}", sim
+    total, minute = rng["n_days"] * MINUTES_PER_DAY, minute or 0
+    trigger = ctx.triggered_id
+    if trigger == "range-store":
+        return 0, 0
+    if trigger == "day-select":
+        if day is None or day == minute // MINUTES_PER_DAY:
+            return no_update, no_update
+        return day * MINUTES_PER_DAY + minute % MINUTES_PER_DAY, no_update
+    if trigger == "interval":
+        minute = (minute + speed) % total
+        new_day = minute // MINUTES_PER_DAY
+        return minute, (new_day if new_day != day else no_update)
+    new_day = minute // MINUTES_PER_DAY          # slider dragged
+    return no_update, (new_day if new_day != day else no_update)
+
+
+@app.callback(
+    Output("sim-store", "data"),
+    Input("day-select", "value"),
+    Input("range-store", "data"),
+)
+def load_day(day, rng):
+    """Send the browser the replay day being shown (one day at a time, about 3 MB)."""
+    if not rng:
+        return no_update
+    day = min(max(int(day or 0), 0), rng["n_days"] - 1)
+    if day + 1 < rng["n_days"]:          # warm the next day so playback doesn't stall at midnight
+        threading.Thread(target=dd.day_chunk, daemon=True,
+                         args=(rng["policy"], rng["d0"] + day + 1, rng["d0"])).start()
+    return dict(dd.day_chunk(rng["policy"], rng["d0"] + day, rng["d0"]), n_days=rng["n_days"])
 
 
 @app.callback(
@@ -574,17 +676,6 @@ def on_simulation_change(date_str, policy):
 def toggle_play(n_clicks, currently_disabled):
     now_playing = currently_disabled
     return (not now_playing), ("■ Stop" if now_playing else "▶ Play")
-
-
-@app.callback(
-    Output("time-slider", "value"),
-    Input("interval", "n_intervals"),
-    State("time-slider", "value"),
-    State("speed-select", "value"),
-    prevent_initial_call=True,
-)
-def advance_time(_, current_min, speed):
-    return (current_min + speed) % 1440
 
 
 # ── Clientside: animation — rebuilds the figure; uirevision keeps the view ────
@@ -604,8 +695,8 @@ app.clientside_callback(
 
 
 if __name__ == "__main__":
-    print(f"Simulating {DEFAULT_DATE} ...")
-    get_simulation(DEFAULT_DATE, DEFAULT_POLICY)
+    print("Loading the replay for", POLICIES[DEFAULT_POLICY].label, "...")
+    dd.load(DEFAULT_POLICY)
     print("Loading road network for truck routes ...")
     from road_routes import get_router
     get_router()

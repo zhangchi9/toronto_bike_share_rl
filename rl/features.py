@@ -7,14 +7,17 @@ Action (Discrete(1 + Z*(Z-1)*len(QTY_LEVELS))):
     0                   wait
     1 + i               i -> (source zone, destination zone, qty level)
 Observation (float32): per zone [fill, share empty, share full, 60-min net change],
-time of day (sin, cos), day of week one-hot, the asked truck (zone one-hot, load),
-then every other truck (zone one-hot, busy, minutes left).
+(round 4, forecast=True) per zone forecast [rentals, returns] in the next 60 and
+180 min per dock (rl/forecast.py), time of day (sin, cos), day of week one-hot,
+the asked truck (zone one-hot, load), then every other truck (zone one-hot, busy,
+minutes left).
 """
 from collections import deque
 
 import numpy as np
 
 from bikeshare_env.env import MINUTES_PER_DAY, BikeShareEnv
+from rl import forecast as fc
 from rl.zones import Zones
 
 QTY_LEVELS = (10, 20, 40)
@@ -34,16 +37,21 @@ def encode_action(src_zone: int, dst_zone: int, qty: int, n_zones: int) -> int:
     return 1 + pair * len(QTY_LEVELS) + QTY_LEVELS.index(qty)
 
 
-def obs_size(n_zones: int, n_trucks: int) -> int:
-    return 4 * n_zones + 2 + 7 + (n_zones + 1) + (n_trucks - 1) * (n_zones + 2)
+def obs_size(n_zones: int, n_trucks: int, forecast: bool = True) -> int:
+    n_fc = len(fc.TARGETS) * n_zones if forecast else 0
+    return 4 * n_zones + n_fc + 2 + 7 + (n_zones + 1) + (n_trucks - 1) * (n_zones + 2)
 
 
 class FeatureBuilder:
     """Holds the zone history for one env episode; builds obs and decodes actions."""
 
-    def __init__(self, env: BikeShareEnv, zones: Zones):
+    def __init__(self, env: BikeShareEnv, zones: Zones, forecast: bool = True):
         self.env = env
         self.z = zones
+        self.forecast = forecast
+        # Demand forecast table (slot, zone, target), looked up by absolute time.
+        self.fc_table = fc.load_table(zones.zone_of_station, env.station_ids) if forecast else None
+        self.fc_slot0 = fc.slot_index(env.start_date, 0) * fc.SLOT_MIN   # env minute 0, absolute
         Z = zones.n_zones
         self.zone_cap = np.bincount(zones.zone_of_station, weights=env.capacity, minlength=Z)
         self.n_in_zone = np.bincount(zones.zone_of_station, minlength=Z).astype(float)
@@ -77,7 +85,11 @@ class FeatureBuilder:
         dow = np.zeros(7)
         dow[(env.start_date.dayofweek + t // MINUTES_PER_DAY) % 7] = 1
 
-        parts = [fill, empty, full, np.clip(net, -1, 1), [np.sin(ang), np.cos(ang)], dow]
+        parts = [fill, empty, full, np.clip(net, -1, 1)]
+        if self.forecast:          # forecast trips per dock, one block per target
+            f = self.fc_table[(self.fc_slot0 + t) // fc.SLOT_MIN] / np.maximum(self.zone_cap, 1)[:, None]
+            parts += list(np.clip(f, 0, 1).T)
+        parts += [[np.sin(ang), np.cos(ang)], dow]
         me = env.trucks[truck_k]
         parts += [np.eye(Z)[zof[me.location]], [me.load / env.truck_capacity]]
         for j, tk in enumerate(env.trucks):

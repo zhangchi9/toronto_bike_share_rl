@@ -1,51 +1,59 @@
-"""Run a policy through one simulated day and record per-minute state/metrics."""
+"""Run a policy through a simulated period (one or more days) and record per-minute state."""
 from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
 
 import bikeshare_env  # noqa: F401  (registers the env)
-from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY, MINUTES_PER_DAY, BikeShareEnv
+from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY, BikeShareEnv
 from bikeshare_env.policies import POLICIES
 from bikeshare_env.trips import TripEvents
 
 
 @dataclass
 class DayRollout:
-    """Index m of every per-minute array = state after minute m was simulated."""
-    bikes: np.ndarray          # (1440, N) uint8 bikes docked per station
-    reward: np.ndarray         # (1440,) reward earned in that minute
-    fulfilled: np.ndarray      # (1440,) requests served (rentals started)
-    lost: np.ndarray           # (1440,) requests lost (empty station)
-    active: np.ndarray         # (1440,) bikes out on a ride after that minute
-    blocked: np.ndarray        # (1440,) returns refused (end station full)
-    pending: np.ndarray        # (1440,) refused bikes still held (15-min delay)
+    """Index m of every per-minute array = state after minute m of the period was simulated
+    (T = days * 1440 minutes; minute 0 = 00:00 on the first day)."""
+    bikes: np.ndarray          # (T, N) uint8 bikes docked per station
+    reward: np.ndarray         # (T,) reward earned in that minute
+    fulfilled: np.ndarray      # (T,) requests served (rentals started)
+    lost: np.ndarray           # (T,) requests lost (empty station)
+    active: np.ndarray         # (T,) bikes out on a ride after that minute
+    blocked: np.ndarray        # (T,) returns refused (end station full)
+    pending: np.ndarray        # (T,) refused bikes still held (15-min delay)
     trips: TripEvents
     trip_started: np.ndarray   # (n_trips,) bool, request was served
     totals: dict
     # Trucks (empty when the policy has none):
     truck_legs: np.ndarray     # (n_legs, 6) int: truck, from, to, depart, arrive, load
-    truck_status: np.ndarray   # (1440, K) int8: 0 idle, 1 driving, 2 loading/unloading
-    truck_load: np.ndarray     # (1440, K) bikes on each truck after that minute
-    truck_station: np.ndarray  # (1440, K) station the truck is at / driving to
-    truck_moved: np.ndarray    # (1440,) cumulative bikes moved by trucks
+    truck_status: np.ndarray   # (T, K) int8: 0 idle, 1 driving, 2 loading/unloading
+    truck_load: np.ndarray     # (T, K) bikes on each truck after that minute
+    truck_station: np.ndarray  # (T, K) station the truck is at / driving to
+    truck_moved: np.ndarray    # (T,) cumulative bikes moved by trucks
 
 
 def simulate_day(date: str, policy_key: str, init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
                  **env_kwargs) -> DayRollout:
+    return simulate_period(date, date, policy_key, init_occupancy, **env_kwargs)
+
+
+def simulate_period(start: str, end: str, policy_key: str,
+                    init_occupancy: float = DEFAULT_INIT_OCCUPANCY, **env_kwargs) -> DayRollout:
+    """One continuous run from `start` 00:00 to `end` 23:59: stations are filled to
+    `init_occupancy` once, at the start, and bikes carry over between days."""
     policy = POLICIES[policy_key]()
     env_kwargs.setdefault("number_trucks", policy.number_trucks)
     for key, value in policy.env_kwargs().items():
         env_kwargs.setdefault(key, value)
     # One step per minute so every minute is recorded, even while trucks are busy.
     env = gym.make("BikeShareToronto-v0", init_occupancy=init_occupancy,
-                   simulation_period=(date, date), skip_when_all_busy=False,
+                   simulation_period=(start, end), skip_when_all_busy=False,
                    **env_kwargs)
     u: BikeShareEnv = env.unwrapped
     obs, info = env.reset(seed=0)
     policy.reset(u)
 
-    T, N = MINUTES_PER_DAY, u.n_stations
+    T, N = u.total_minutes, u.n_stations
     bikes = np.zeros((T, N), dtype=np.uint8)
     reward = np.zeros(T)
     fulfilled = np.zeros(T, dtype=np.int64)

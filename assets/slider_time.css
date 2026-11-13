@@ -1,0 +1,6 @@
+/* Keep the time-slider tooltip ("Mon Aug 3 21:27") on one line. */
+.dash-slider-tooltip,
+.dash-slider-tooltip > div {
+    white-space: nowrap;
+    width: max-content;
+}

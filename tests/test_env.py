@@ -249,3 +249,93 @@ def test_multi_stop_full_dropoff_zone_falls_back_to_nearest_free():
 def test_multi_stop_needs_both_settings():
     env = make_env(number_trucks=1, station_zone=np.zeros(4, dtype=int))
     assert not env.multi_stop
+
+
+# Paired trucks: 8 stations on a line, zone 0 = stations 0-3, zone 1 = stations 4-7.
+POS8 = np.arange(8)
+DIST8 = np.abs(POS8[:, None] - POS8[None, :]).astype(float)
+
+
+def make_pair_env(bikes, capacity=(10,) * 8):
+    stations = pd.DataFrame({
+        "station_id": list(range(300, 308)),
+        "lat": [43.65 + 0.01 * i for i in range(8)], "lon": [-79.38] * 8,
+        "capacity": list(capacity),
+    })
+    events = TripEvents.from_frame(pd.DataFrame(
+        [], columns=["start_min", "end_min", "start_idx", "end_idx", "rent_min"]))
+    env = BikeShareEnv(init_occupancy=0.0, simulation_period=("2026-06-15", "2026-06-15"),
+                       stations=stations, trips=events, road_dist_km=DIST8,
+                       road_time_min=2 * DIST8, depot_station=300, number_trucks=2,
+                       skip_when_all_busy=False, truck_capacity=40,
+                       station_zone=np.array([0, 0, 0, 0, 1, 1, 1, 1]),
+                       max_bikes_per_stop=5, paired_trucks=True)
+    env.reset(seed=0)
+    env.bikes[:] = bikes
+    return env
+
+
+def run_pair_mission(env, pickup, dropoff, qty, minutes=300):
+    """One paired order; per truck, the stations where its load changed and by how much."""
+    stops = [[], []]
+    before = env.bikes.copy()
+    loads = [tk.load for tk in env.trucks]
+    env.step(np.array([[pickup + 1, dropoff, qty], [0, 0, 0]]))
+    for _ in range(minutes):
+        for k, tk in enumerate(env.trucks):
+            if tk.load != loads[k]:
+                stops[k].append((tk.location, tk.load - loads[k]))
+                loads[k] = tk.load
+        if not any(tk.busy(env.t) for tk in env.trucks):
+            break
+        env.step(np.zeros((2, 3), dtype=np.int64))
+    return stops, env.bikes - before
+
+
+def test_paired_trucks_split_odd_and_even_ranks():
+    # Pickup ranks (pickup station 0 first, then most bikes): 0, 2, 1, 3.
+    # Drop-off ranks (station 4 first, then most free docks): 4, 5, 6, 7.
+    env = make_pair_env([9, 7, 8, 3, 0, 2, 4, 6])
+    stops, delta = run_pair_mission(env, pickup=0, dropoff=4, qty=10)
+    assert stops[0] == [(0, 5), (1, 5), (4, -5), (6, -5)]      # ranks 1, 3
+    assert stops[1] == [(2, 5), (3, 3), (5, -5), (7, -3)]      # ranks 2, 4 (zone ran dry)
+    assert delta.tolist() == [-5, -5, -5, -3, 5, 5, 5, 3]
+    assert env.totals["bikes_moved"] == 18
+    assert all(abs(n) <= 5 for s in stops for _, n in s)
+
+
+def test_paired_second_truck_stays_idle_without_a_station():
+    env = make_pair_env([6, 0, 0, 0, 0, 0, 0, 0])
+    stops, delta = run_pair_mission(env, pickup=0, dropoff=4, qty=10)
+    assert stops[0] == [(0, 5), (4, -5)] and stops[1] == []
+    assert delta.tolist() == [-5, 0, 0, 0, 5, 0, 0, 0]
+    assert env.trucks[1].location == 0 and env.totals["truck_km"] == pytest.approx(4.0)
+
+
+def test_paired_orders_wait_for_both_trucks_and_read_row_0_only():
+    env = make_pair_env([9, 7, 8, 3, 0, 2, 4, 6])
+    env.step(np.array([[0, 0, 0], [1, 4, 10]]))                 # row 1 is ignored
+    assert not any(tk.busy(env.t) for tk in env.trucks)
+    env.step(np.array([[1, 4, 10], [0, 0, 0]]))
+    assert all(tk.busy(env.t) for tk in env.trucks)
+    while env.trucks[0].busy(env.t) and env.trucks[1].busy(env.t):
+        env.step(np.zeros((2, 3), dtype=np.int64))
+    env.step(np.array([[4, 6, 10], [0, 0, 0]]))                 # one truck still busy: ignored
+    while any(tk.busy(env.t) for tk in env.trucks):
+        env.step(np.zeros((2, 3), dtype=np.int64))
+    # Only the first order ran (same result as test_paired_trucks_split_odd_and_even_ranks).
+    assert env.bikes.tolist() == [4, 2, 3, 0, 5, 7, 9, 9]
+
+
+def test_paired_trucks_need_multi_stop_and_two_trucks():
+    stations = pd.DataFrame({"station_id": [1, 2], "lat": [43.6, 43.7], "lon": [-79.4] * 2,
+                             "capacity": [10, 10]})
+    events = TripEvents.from_frame(pd.DataFrame(
+        [], columns=["start_min", "end_min", "start_idx", "end_idx", "rent_min"]))
+    d = np.array([[0.0, 1.0], [1.0, 0.0]])
+    kw = dict(stations=stations, trips=events, road_dist_km=d, road_time_min=d,
+              simulation_period=("2026-06-15", "2026-06-15"), paired_trucks=True)
+    with pytest.raises(ValueError):
+        BikeShareEnv(number_trucks=2, **kw)                     # no multi-stop
+    with pytest.raises(ValueError):
+        BikeShareEnv(number_trucks=1, station_zone=np.array([0, 0]), max_bikes_per_stop=5, **kw)
