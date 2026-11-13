@@ -3,7 +3,7 @@
 Shared by the training wrapper (rl/wrapper.py) and the dashboard adapter
 (rl/policy.py) so a trained model sees exactly the same inputs in both.
 
-Action (Discrete(1 + Z*(Z-1)*len(QTY_LEVELS))):
+Action (Discrete(1 + Z*(Z-1)*len(QTY_LEVELS)), Z = zones trucks can reach):
     0                   wait
     1 + i               i -> (source zone, destination zone, qty level)
 Observation (float32): per zone [fill, share empty, share full, 60-min net change],
@@ -28,7 +28,16 @@ NET_CHANGE_SCALE = 10.0
 
 
 def n_actions(n_zones: int) -> int:
+    """Wait + every (source, destination, load) over `n_zones` truck-reachable zones."""
     return 1 + n_zones * (n_zones - 1) * len(QTY_LEVELS)
+
+
+def truck_zones(zones: Zones, station_ids: np.ndarray) -> np.ndarray:
+    """Zones with at least one station trucks can serve, in zone order. Actions are
+    over these only: an island-only zone (round 5) would just add dead actions."""
+    from bikeshare_env.env import ISLAND_STATIONS
+    ok = ~np.isin(station_ids, ISLAND_STATIONS)
+    return np.array([z for z, idx in enumerate(zones.stations_in_zone) if ok[idx].any()])
 
 
 def encode_action(src_zone: int, dst_zone: int, qty: int, n_zones: int) -> int:
@@ -55,8 +64,10 @@ class FeatureBuilder:
         Z = zones.n_zones
         self.zone_cap = np.bincount(zones.zone_of_station, weights=env.capacity, minlength=Z)
         self.n_in_zone = np.bincount(zones.zone_of_station, minlength=Z).astype(float)
-        # Truck-usable stations per zone (no ferry-only stations).
+        # Truck-usable stations per zone (no ferry-only stations); action zone index ->
+        # zone id (all zones under k-means; every zone but the island in round 5).
         self.truck_stations = [s[~env.truck_blocked[s]] for s in zones.stations_in_zone]
+        self.action_zones = np.array([z for z in range(Z) if len(self.truck_stations[z])])
         self.history = deque(maxlen=HISTORY_MIN + 1)
 
     def reset(self) -> None:
@@ -104,11 +115,12 @@ class FeatureBuilder:
         a = int(action)
         if a <= 0:
             return np.zeros(3, dtype=np.int64)
-        Z, nq = self.z.n_zones, len(QTY_LEVELS)
+        Z, nq = len(self.action_zones), len(QTY_LEVELS)
         a -= 1
         q, pair = QTY_LEVELS[a % nq], a // nq
         src, dj = divmod(pair, Z - 1)
         dst = dj if dj < src else dj + 1
+        src, dst = int(self.action_zones[src]), int(self.action_zones[dst])
 
         env = self.env
         cand = self.truck_stations[src]

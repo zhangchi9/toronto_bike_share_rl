@@ -14,7 +14,8 @@ import os
 import numpy as np
 
 from bikeshare_env.policies import POLICIES, Policy
-from rl.features import TRUCK_CAPACITY, FeatureBuilder, encode_action, obs_size
+from rl import zones as zz
+from rl.features import TRUCK_CAPACITY, FeatureBuilder, encode_action, obs_size, truck_zones
 from rl.train import model_dir
 from rl.wrapper import multi_stop_kwargs, static_data
 
@@ -27,12 +28,13 @@ class ZoneActionPolicy(Policy):
     multi_stop = True       # round-3 rule: <= 5 bikes per station, several stops per zone
     paired = False          # both trucks run every order together (env paired_trucks)
     forecast = True         # round-4 demand forecast features in the observation
+    zone_scheme = None      # None = zones.ZONE_SCHEME (what the agents were trained on)
 
     @classmethod
     def env_kwargs(cls) -> dict:
         kw = super().env_kwargs()
         if cls.multi_stop:
-            kw.update(multi_stop_kwargs())
+            kw.update(multi_stop_kwargs(cls.zone_scheme))
         if cls.paired:
             kw["paired_trucks"] = True
         return kw
@@ -40,7 +42,7 @@ class ZoneActionPolicy(Policy):
     def reset(self, env) -> None:
         super().reset(env)
         self.env = env
-        self.fb = FeatureBuilder(env, static_data()["zones"], forecast=self.forecast)
+        self.fb = FeatureBuilder(env, zz.load_zones(self.zone_scheme), forecast=self.forecast)
         self.fb.reset()
         self.first = True
 
@@ -82,12 +84,15 @@ class FixShuttlePolicy(ZoneActionPolicy):
     label = "Fixed shuttle (1 truck)"
     number_trucks = 1
     multi_stop = False      # keeps the single pickup / single drop-off station rule
+    forecast = False        # it ignores its inputs
+    zone_scheme = "kmeans"  # zones 12 and 11 are k-means zones: same rule as rounds 1-4
     source_zone, dest_zone, qty = 12, 11, 10
 
     @classmethod
     def action(cls) -> int:
+        z = zz.load_zones(cls.zone_scheme)
         return encode_action(cls.source_zone, cls.dest_zone, cls.qty,
-                             static_data()["zones"].n_zones)
+                             len(truck_zones(z, static_data()["ids"])))
 
     def choose(self, obs_vector):
         return self.action()

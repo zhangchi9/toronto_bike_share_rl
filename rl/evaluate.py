@@ -52,11 +52,11 @@ def run_no_trucks():
     return _summary("No trucks (benchmark)", 0, env.totals, rewards, time.time() - t0)
 
 
-def run_wrapped(name, trucks, choose, multi_stop=True):
+def run_wrapped(name, trucks, choose, multi_stop=True, zone_scheme=None, forecast=True):
     """`choose(obs, env) -> discrete action` for each decision."""
     t0 = time.time()
     env = RebalanceEnv(number_trucks=trucks, windows=[TEST_PERIOD], record_minutes=True,
-                       multi_stop=multi_stop)
+                       multi_stop=multi_stop, zone_scheme=zone_scheme, forecast=forecast)
     obs, _ = env.reset(seed=0)
     done = False
     while not done:
@@ -109,8 +109,10 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     rows = []
     for name, k, choose in policies_to_run():
+        shuttle = name == "fix_shuttle_policy"     # single-stop rule on the k-means zones
         r = run_no_trucks() if choose is None else run_wrapped(
-            name, k, choose, multi_stop=(name != "fix_shuttle_policy"))
+            name, k, choose, multi_stop=not shuttle,
+            zone_scheme="kmeans" if shuttle else None, forecast=not shuttle)
         rows.append(r)
         print(f"  {name:22s} trucks={k}  reward ${r['total_reward']:,.0f}  ({r['seconds']:.0f}s)")
 

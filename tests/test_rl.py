@@ -18,9 +18,22 @@ def env(request):
 
 def test_spaces_sizes(env):
     assert QTY_LEVELS == (10, 20, 40) and env.env.truck_capacity == 40
+    # Round 5 zones: 20 truck zones (actions) + the island zone (observed only).
+    assert env.zones.n_zones == 21 and len(env.fb.action_zones) == 20
     assert env.action_space.n == n_actions(20) == 1 + 20 * 19 * len(QTY_LEVELS) == 1141
-    assert env.observation_space.shape == (obs_size(20, env.K),) == ((190,) if env.K == 1 else (212,))
+    assert env.observation_space.shape == (obs_size(21, env.K),) == ((199,) if env.K == 1 else (222,))
+    assert obs_size(20, env.K) == (190 if env.K == 1 else 212)                  # round 4
     assert obs_size(20, env.K, forecast=False) == (110 if env.K == 1 else 132)   # rounds 1-3
+
+
+def test_island_zone_is_never_an_action(env):
+    island = env.zones.n_zones - 1
+    assert island not in env.fb.action_zones
+    zof = env.zones.zone_of_station
+    for a in range(1, env.action_space.n):
+        row = env.fb.decode(a)
+        if row.any():
+            assert zof[row[0] - 1] != island and zof[row[1]] != island
 
 
 def test_wait_only_training_reward_is_zero_and_true_reward_reconstructs(env):
@@ -128,7 +141,8 @@ def test_fix_shuttle_policy_same_on_dashboard_and_in_eval():
     from rl.policy import FixShuttlePolicy
 
     r = simulate_day("2026-07-18", "fix_shuttle_policy")
-    env = RebalanceEnv(number_trucks=1, windows=WINDOW, multi_stop=False)   # single-stop rule
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, multi_stop=False,   # single-stop rule
+                       zone_scheme="kmeans", forecast=False)                   # rounds 1-4 zones
     env.reset(seed=0)
     zof, a, done = env.zones.zone_of_station, FixShuttlePolicy.action(), False
     while not done:
@@ -188,7 +202,7 @@ def test_duplicated_dqn_runs_both_trucks_on_every_order():
 
 def test_forecast_block_is_the_table_entry_for_the_current_slot(env):
     from rl import forecast as fc
-    fb, u, Z = env.fb, env.env, 20
+    fb, u, Z = env.fb, env.env, env.zones.n_zones
     for _ in range(40):                          # move into the day a bit
         env.step(0)
     obs = fb.obs(env.queue[0])

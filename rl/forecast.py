@@ -41,7 +41,20 @@ TEST_RANGE = ("2026-08-01", "2026-09-20")
 HOLIDAYS = ("2026-01-01", "2026-02-16", "2026-04-03", "2026-05-18", "2026-07-01",
             "2026-08-03", "2026-09-07")
 FORECAST_DIR = os.path.join("models", "forecast")
-FORECAST_PATH = os.path.join(FORECAST_DIR, "zone_demand.npz")
+FORECAST_PATH = os.path.join(FORECAST_DIR, "zone_demand.npz")   # round 4 (k-means zones)
+
+
+def table_path(zone_of_station: np.ndarray) -> str:
+    """One table per zone layout: the round-4 file if it matches, else a file named
+    after the layout (number of zones + a hash of the station -> zone map)."""
+    import hashlib
+    if os.path.exists(FORECAST_PATH):
+        with np.load(FORECAST_PATH) as d:
+            if np.array_equal(d["zone_of_station"], zone_of_station):
+                return FORECAST_PATH
+    z = np.asarray(zone_of_station, dtype=np.int64)
+    tag = hashlib.sha1(z.tobytes()).hexdigest()[:8]
+    return os.path.join(FORECAST_DIR, f"zone_demand_{z.max() + 1}z_{tag}.npz")
 FEATURE_NAMES = ("zone", "slot_of_day", "day_of_week", "off_day",
                  "rentals_last60", "returns_last60", "rentals_last24h", "returns_last24h",
                  "rentals_same_window_1d", "returns_same_window_1d",
@@ -167,7 +180,9 @@ def build(zone_of_station: np.ndarray, station_ids: np.ndarray, path: str = FORE
                         data_start=str(DATA_START.date()),
                         targets=np.array([f"{k}_{h}" for k, h in TARGETS]),
                         zone_of_station=zone_of_station)
-    with open(os.path.join(os.path.dirname(path), "metrics.json"), "w") as f:
+    metrics_path = (os.path.join(os.path.dirname(path), "metrics.json") if path == FORECAST_PATH
+                    else path[:-4] + "_metrics.json")
+    with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     return metrics
 
@@ -200,15 +215,16 @@ _cache = {}
 
 
 def load_table(zone_of_station: np.ndarray, station_ids: np.ndarray) -> np.ndarray:
-    """(n_slots, Z, 4) forecast table; built on first use if the file is missing."""
-    if "table" not in _cache:
-        if not os.path.exists(FORECAST_PATH):
-            build(zone_of_station, station_ids)
-        d = np.load(FORECAST_PATH)
+    """(n_slots, Z, 4) forecast table for this zone layout; built on first use."""
+    path = table_path(zone_of_station)
+    if path not in _cache:
+        if not os.path.exists(path):
+            build(zone_of_station, station_ids, path=path)
+        d = np.load(path)
         if not np.array_equal(d["zone_of_station"], zone_of_station):
-            raise ValueError(f"{FORECAST_PATH} was built for other zones; delete it to rebuild")
-        _cache["table"] = d["table"]
-    return _cache["table"]
+            raise ValueError(f"{path} was built for other zones; delete it to rebuild")
+        _cache[path] = d["table"]
+    return _cache[path]
 
 
 def slot_index(start_date: pd.Timestamp, t: int) -> int:
@@ -219,5 +235,6 @@ def slot_index(start_date: pd.Timestamp, t: int) -> int:
 if __name__ == "__main__":
     from rl.wrapper import static_data
     s = static_data()
-    print("building", FORECAST_PATH)
-    build(s["zones"].zone_of_station, s["ids"])
+    path = table_path(s["zones"].zone_of_station)
+    print("building", path)
+    build(s["zones"].zone_of_station, s["ids"], path=path)

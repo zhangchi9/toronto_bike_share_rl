@@ -330,7 +330,8 @@ function(current_min, show_zones, sim, station_data, layout, zones) {
     if (zones && zones.length && show_zones && show_zones.indexOf('on')>=0) {
         var ZC=['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2',
                 '#7f7f7f','#bcbd22','#17becf','#393b79','#637939','#8c6d31','#843c39',
-                '#7b4173','#3182bd','#e6550d','#31a354','#756bb1','#636363'];
+                '#7b4173','#3182bd','#e6550d','#31a354','#756bb1','#636363',
+                '#111111'];   // 21st: the island zone (round 5 zones)
         zones.forEach(function(z, i) {
             var c=ZC[i%ZC.length];
             var r=parseInt(c.slice(1,3),16), g=parseInt(c.slice(3,5),16), b=parseInt(c.slice(5,7),16);

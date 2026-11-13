@@ -54,8 +54,11 @@ def _path(policy_key: str) -> str:
 
 def fingerprint(policy_key: str) -> dict:
     """What a replay depends on; a stored replay with a different fingerprint is rebuilt."""
+    from rl import zones as zz
+    cls = POLICIES[policy_key]
     fp = {"format": FORMAT_VERSION, "policy": policy_key, "start": REPLAY_START,
-          "end": REPLAY_END, "init_occupancy": DEFAULT_INIT_OCCUPANCY, "model": None}
+          "end": REPLAY_END, "init_occupancy": DEFAULT_INIT_OCCUPANCY, "model": None,
+          "zones": getattr(cls, "zone_scheme", None) or zz.ZONE_SCHEME}
     model = getattr(POLICIES[policy_key], "path", "")
     if model and os.path.exists(model):
         st = os.stat(model)
