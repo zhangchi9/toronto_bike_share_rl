@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY, MINUTES_PER_DAY
+from rl import zones as zz
 from rl.train import model_dir
 from rl.wrapper import TEST_PERIOD, RebalanceEnv, make_base_env
 
@@ -112,7 +113,7 @@ def main():
         shuttle = name == "fix_shuttle_policy"     # single-stop rule on the k-means zones
         r = run_no_trucks() if choose is None else run_wrapped(
             name, k, choose, multi_stop=not shuttle,
-            zone_scheme="kmeans" if shuttle else None, forecast=not shuttle)
+            zone_scheme="kmeans" if shuttle else zz.ROUND5_SCHEME, forecast=not shuttle)
         rows.append(r)
         print(f"  {name:22s} trucks={k}  reward ${r['total_reward']:,.0f}  ({r['seconds']:.0f}s)")
 

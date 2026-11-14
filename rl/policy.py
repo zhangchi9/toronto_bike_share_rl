@@ -64,6 +64,7 @@ class ZoneActionPolicy(Policy):
 class RLPolicy(ZoneActionPolicy):
     algo = ""
     path = ""
+    zone_scheme = zz.ROUND5_SCHEME   # models/<algo>_<k>trucks were trained on these zones
     _model = None
 
     @classmethod

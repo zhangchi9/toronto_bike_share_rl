@@ -112,7 +112,7 @@ def test_dashboard_adapter_matches_wrapper(monkeypatch):
     monkeypatch.setitem(rp.POLICIES, "scripted", cls)
     r = simulate_day("2026-07-18", "scripted")
 
-    env = RebalanceEnv(number_trucks=1, windows=WINDOW)
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, zone_scheme=cls.zone_scheme)
     env.reset(seed=0)
     model, done = Scripted(), False
     while not done:

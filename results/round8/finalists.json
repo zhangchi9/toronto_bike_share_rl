@@ -1,0 +1,2 @@
+{"finalists": ["flow_w0.3_k20_need", "flow_w0.3_k12_docks", "flow_w0.3_k25_need"],
+ "rule": "top 3 new zone sets by the mean gain of their 3 best fixed routes on the training period (May 1 - Jul 17); the best-route score ranks the reference sets like the DQN evidence (w = 0.7 last), the greedy score does not (w = 0.7 first)"}

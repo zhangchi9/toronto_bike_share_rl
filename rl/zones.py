@@ -13,15 +13,20 @@ Two schemes:
 """
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
 from sklearn.cluster import KMeans
 
 N_ZONES = 20                     # mainland zones (k-means: all zones)
-# Zones the RL agents, forecast and dashboard use. Rounds 1-4: "kmeans"; round 5 on:
-# 70% demand / 30% road, dock-balanced, island zone. The fixed shuttle stays on k-means.
-ZONE_SCHEME = "flow_w0.3"
+# Zones the RL agents, forecast and dashboard use by default. Rounds 1-4: "kmeans";
+# rounds 5-7: "flow_w0.3" (70% demand / 30% road, 20 dock-balanced zones + island);
+# round 8 on: 20 zones balanced on docks + rebalancing need, the best set for DQN with
+# 1 truck. The fixed shuttle stays on k-means.
+ZONE_SCHEME = "flow_w0.3_k20_need"
+# Zones of the models in models/<algo>_<k>trucks/ (trained in round 5).
+ROUND5_SCHEME = "flow_w0.3"
 ZONES_DIR = os.path.join("models", "zones")
 DOCK_BAND = 0.10                 # flow zones: docks within +-10% of the mean
 FLOW_FORMAT = 1
@@ -198,12 +203,82 @@ def _fix_isolated(labels, T, docks, lo, hi, n_nb: int = 4, passes: int = 5):
     return labels, n_before, moved
 
 
-def flow_scheme(w: float) -> str:
-    return f"flow_w{w:g}"
+BALANCES = ("docks", "need")
+_SCHEME_RE = re.compile(r"flow_w([0-9.]+)(?:_k(\d+))?(?:_(docks|need))?$")
 
 
-def build_flow_zones(w: float = 0.5, verbose: bool = True) -> Zones:
-    """Island zone + 20 dock-balanced mainland zones; saved to models/zones/."""
+def flow_scheme(w: float, k: int = N_ZONES, balance: str = "docks") -> str:
+    """Scheme name: "flow_w0.3" for 20 dock-balanced zones (rounds 5-7), else e.g.
+    "flow_w0.3_k30_need"."""
+    if k == N_ZONES and balance == "docks":
+        return f"flow_w{w:g}"
+    return f"flow_w{w:g}_k{k}_{balance}"
+
+
+def parse_flow_scheme(scheme: str) -> tuple[float, int, str]:
+    m = _SCHEME_RE.match(scheme)
+    if not m:
+        raise ValueError(f"unknown zone scheme {scheme!r}")
+    return float(m.group(1)), int(m.group(2) or N_ZONES), m.group(3) or "docks"
+
+
+NEED_FILE = "station_need.npz"
+
+
+def station_need(verbose: bool = True) -> np.ndarray:
+    """(N,) rebalancing need per station row: lost requests (empty station) plus
+    blocked returns (full station) in one no-truck run over the training period
+    (May 1 - Jul 17, bikes carry over). Cached in models/zones/station_need.npz."""
+    from rl import forecast as fc
+    from rl.wrapper import static_data
+    ids = static_data()["ids"]
+    path = os.path.join(ZONES_DIR, NEED_FILE)
+    if os.path.exists(path):
+        with np.load(path) as f:
+            if np.array_equal(f["station_ids"], ids):
+                return f["need"]
+    from bikeshare_env.rollout import simulate_period
+    r = simulate_period(*fc.TRAIN_RANGE, "no_rebalancing")
+    t = r.trips
+    if r.bikes.shape[1] != len(ids):
+        raise ValueError("simulator station list does not match static_data")
+    N, T = len(ids), len(r.bikes)
+    cap = static_data()["stations"]["capacity"].to_numpy()
+    lost = np.bincount(t.start_idx[~r.trip_started], minlength=N)
+    ok = r.trip_started & (t.end_min >= 1) & (t.end_min <= T)
+    e_min, e_idx = t.end_min[ok], t.end_idx[ok]
+    full = r.bikes[e_min - 1, e_idx] >= cap[e_idx]
+    blocked = np.bincount(e_idx[full], minlength=N)
+    need = (lost + blocked).astype(float)
+    os.makedirs(ZONES_DIR, exist_ok=True)
+    np.savez(path, need=need, lost=lost, blocked=blocked, station_ids=ids)
+    if verbose:
+        print(f"  station need: {lost.sum():,} lost + {blocked.sum():,} blocked returns")
+    return need
+
+
+def zone_weights(balance: str, cap: np.ndarray) -> np.ndarray:
+    """(N,) what the zone band balances: docks, or half docks share + half need share
+    (rescaled to dock units, so the +-10% band means the same thing)."""
+    cap = np.asarray(cap, float)
+    if balance == "docks":
+        return cap
+    from bikeshare_env.env import ISLAND_STATIONS
+    from rl.wrapper import static_data
+    need = station_need(verbose=False)
+    main = ~np.isin(static_data()["ids"], ISLAND_STATIONS)
+    share = 0.5 * cap / cap[main].sum() + 0.5 * need / max(need[main].sum(), 1.0)
+    return share * cap[main].sum()
+
+
+def build_flow_zones(w: float = 0.5, verbose: bool = True, k: int = N_ZONES,
+                     balance: str = "docks") -> Zones:
+    """Island zone (zone k) + k balanced mainland zones; saved to models/zones/.
+    balance="docks": each zone holds 0.9-1.1x the mean docks. balance="need": the
+    band applies to a weight that is half docks share, half rebalancing-need share
+    (station_need), so areas that run empty or full get smaller zones."""
+    if balance not in BALANCES:
+        raise ValueError(f"balance must be one of {BALANCES}")
     from bikeshare_env.env import ISLAND_STATIONS
     from rl.wrapper import static_data
     s = static_data()
@@ -221,31 +296,32 @@ def build_flow_zones(w: float = 0.5, verbose: bool = True) -> Zones:
     off = ~np.eye(len(main), dtype=bool)
     D = w * Tm / np.median(Tm[off]) + (1 - w) * Dp / np.median(Dp[off])
 
-    docks = cap[main]
-    mean = docks.sum() / N_ZONES
+    weight = zone_weights(balance, cap)[main]
+    mean = weight.sum() / k
     lo, hi = (1 - DOCK_BAND) * mean, (1 + DOCK_BAND) * mean
-    labels = _balanced_kmedoids(D, docks, N_ZONES, lo, hi,
+    labels = _balanced_kmedoids(D, weight, k, lo, hi,
                                 T_norm=Tm / np.median(Tm[off]), contiguity=CONTIGUITY)
-    labels, n_isolated, moved = _fix_isolated(labels, Tm, docks, lo, hi)
+    labels, n_isolated, moved = _fix_isolated(labels, Tm, weight, lo, hi)
 
     xy = _km_xy(lat, lon)[main]          # number mainland zones west -> east
-    order = np.argsort([xy[labels == z, 1].mean() for z in range(N_ZONES)])
-    remap = np.empty(N_ZONES, dtype=np.int64)
-    remap[order] = np.arange(N_ZONES)
-    zone_of = np.full(len(ids), N_ZONES, dtype=np.int64)      # island = zone 20
+    order = np.argsort([xy[labels == z, 1].mean() for z in range(k)])
+    remap = np.empty(k, dtype=np.int64)
+    remap[order] = np.arange(k)
+    zone_of = np.full(len(ids), k, dtype=np.int64)            # island = zone k
     zone_of[main] = remap[labels]
 
-    _loaded.pop(flow_scheme(w), None)
+    name = flow_scheme(w, k, balance)
+    _loaded.pop(name, None)
     os.makedirs(ZONES_DIR, exist_ok=True)
-    meta = {"format": FLOW_FORMAT, "w": w, "dock_band": DOCK_BAND,
-            "isolated_before_fix": n_isolated, "moved_by_fix": moved}
-    np.savez(os.path.join(ZONES_DIR, f"{flow_scheme(w)}.npz"), zone_of_station=zone_of,
+    meta = {"format": FLOW_FORMAT, "w": w, "k": k, "balance": balance,
+            "dock_band": DOCK_BAND, "isolated_before_fix": n_isolated, "moved_by_fix": moved}
+    np.savez(os.path.join(ZONES_DIR, f"{name}.npz"), zone_of_station=zone_of,
              station_ids=ids, meta=np.array(json.dumps(meta)))
     if verbose:
-        d = np.bincount(zone_of, weights=cap)[:N_ZONES]
-        print(f"  {flow_scheme(w)}: docks per zone {d.min():.0f}-{d.max():.0f} "
-              f"(mean {mean:.0f}); isolated {n_isolated}, moved {moved}")
-    return _zones(zone_of, N_ZONES + 1)
+        d = np.bincount(zone_of, weights=cap)[:k]
+        print(f"  {name}: docks per zone {d.min():.0f}-{d.max():.0f} "
+              f"(mean {cap[main].sum() / k:.0f}); isolated {n_isolated}, moved {moved}")
+    return _zones(zone_of, k + 1)
 
 
 _loaded: dict[str, Zones] = {}
@@ -263,15 +339,17 @@ def load_zones(scheme: str | None = None) -> Zones:
         st = s["stations"]
         z = make_zones(st["lat"].to_numpy(), st["lon"].to_numpy())
     elif scheme.startswith("flow_w"):
-        path = os.path.join(ZONES_DIR, f"{scheme}.npz")
+        w, k, balance = parse_flow_scheme(scheme)
+        path = os.path.join(ZONES_DIR, f"{flow_scheme(w, k, balance)}.npz")
         if not os.path.exists(path):
-            z = build_flow_zones(float(scheme[len("flow_w"):]), verbose=False)
+            z = build_flow_zones(w, verbose=False, k=k, balance=balance)
         else:
             with np.load(path) as f:
                 if not np.array_equal(f["station_ids"], s["ids"]):
                     raise ValueError(f"{path} was built for another station list; "
                                      "delete it to rebuild")
-                z = _zones(f["zone_of_station"], N_ZONES + 1)
+                zone_of = f["zone_of_station"]
+                z = _zones(zone_of, int(zone_of.max()) + 1)
     else:
         raise ValueError(f"unknown zone scheme {scheme!r}")
     _loaded[scheme] = z
@@ -294,6 +372,20 @@ def zone_outlines(zones: Zones, lat: np.ndarray, lon: np.ndarray,
                     "clat": round(float(c.y), 5), "clon": round(float(c.x), 5),
                     "stations": int(len(idx)), "docks": int(np.asarray(capacity)[idx].sum())})
     return out
+
+
+def island_zone(zones: Zones) -> int | None:
+    """The zone made of exactly the Toronto Island stations, if there is one."""
+    from bikeshare_env.env import ISLAND_STATIONS
+    from rl.wrapper import static_data
+    island = np.isin(static_data()["ids"], ISLAND_STATIONS)
+    if len(island) != len(zones.zone_of_station):
+        return None
+    zs = np.unique(zones.zone_of_station[island])
+    if len(zs) == 1 and np.array_equal(np.flatnonzero(zones.zone_of_station == zs[0]),
+                                       np.flatnonzero(island)):
+        return int(zs[0])
+    return None
 
 
 def zone_display_shapes(zones: Zones, lat: np.ndarray, lon: np.ndarray,
@@ -326,9 +418,10 @@ def zone_display_shapes(zones: Zones, lat: np.ndarray, lon: np.ndarray,
                       key=lambda p: -p.area)
     main = {z: parts(g)[0] for z, g in shape.items()}
     patches = [p for z, g in shape.items() for p in parts(g)[1:]]
-    # The island zone (zone 20 in the flow schemes) is drawn around its own 7 stations
-    # only: mainland patches are never added to it.
-    takers = [z for z in main if not (zones.n_zones == N_ZONES + 1 and z == N_ZONES)]
+    # The island zone (flow schemes) is drawn around its own 7 stations only:
+    # mainland patches are never added to it.
+    isl = island_zone(zones)
+    takers = [z for z in main if z != isl]
     for _ in range(20):                         # a patch may only touch other patches
         left = []
         for p in patches:
