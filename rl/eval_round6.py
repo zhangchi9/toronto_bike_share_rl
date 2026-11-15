@@ -35,10 +35,11 @@ def model_folder(algo: str, k: int, w: float) -> str:
     return os.path.join("models", "round6", f"{algo}_{k}trucks_w{w:g}")
 
 
-def run(trucks: int, scheme: str, choose) -> dict:
+def run(trucks: int, scheme: str, choose, features=None, stop_rule=None, window=None) -> dict:
     """One test run; `choose(obs, env) -> discrete action`. Also counts orders."""
-    env = RebalanceEnv(number_trucks=trucks, windows=[TEST_PERIOD], record_minutes=True,
-                       zone_scheme=scheme)
+    env = RebalanceEnv(number_trucks=trucks, windows=[window or TEST_PERIOD],
+                       record_minutes=True, zone_scheme=scheme, features=features,
+                       stop_rule=stop_rule)
     obs, _ = env.reset(seed=0)
     done, orders, waits = False, Counter(), 0
     zof = env.zones.zone_of_station

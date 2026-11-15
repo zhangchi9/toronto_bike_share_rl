@@ -87,6 +87,9 @@ class BikeShareEnv(gym.Env):
         max_bikes_per_stop: int | None = None,
         # two trucks run every order together, splitting the zone's ranked stations
         paired_trucks: bool = False,
+        # multi-stop station rule (round 10): which stations, how many bikes each.
+        # None = most bikes / most free docks, at most max_bikes_per_stop each.
+        stop_rule=None,
         # injected data (tests); loaded from disk when None
         stations: pd.DataFrame | None = None,
         trips: TripEvents | None = None,
@@ -170,11 +173,20 @@ class BikeShareEnv(gym.Env):
                 raise ValueError("station_zone needs one zone id per station")
             self._zone_members = {int(z): np.flatnonzero((self.station_zone == z) & ~self.truck_blocked)
                                   for z in np.unique(self.station_zone)}
+        # Station rule for multi-stop missions (round 10). An object with
+        #   scores(env, cand, pickup, frm, first) -> float array, -inf = can't use;
+        #   amount(env, st, pickup, want) -> bikes to load / unload at st.
+        # It picks the first pickup and drop-off stations of an order inside their
+        # zones (the action's stations only name the zones), every next stop, and
+        # the bikes per stop. None keeps the round 3 rule exactly.
+        self.stop_rule = stop_rule if self.multi_stop else None
         # Paired trucks: row 0 of the action is one order run by both trucks (see
         # _dispatch_pair); needs multi-stop missions and exactly 2 trucks.
         self.paired_trucks = bool(paired_trucks)
         if self.paired_trucks and (not self.multi_stop or self.number_trucks != 2):
             raise ValueError("paired_trucks needs multi-stop missions and number_trucks=2")
+        if self.paired_trucks and self.stop_rule is not None:
+            raise ValueError("stop_rule is not supported with paired_trucks")
 
         self.shift_cost = sum(self._hourly_rate(h) for h in range(*shift))
 
@@ -316,6 +328,14 @@ class BikeShareEnv(gym.Env):
             a, b = pickup - 1, dropoff
             if a == b or self.truck_blocked[a] or self.truck_blocked[b]:
                 continue
+            if self.stop_rule is not None:
+                a2 = self._rule_stop(a, set(), pickup=True, frm=tk.location, first=True)
+                if a2 is None:
+                    continue
+                b2 = self._rule_stop(b, set(), pickup=False, frm=a2, first=True)
+                if b2 is None or a2 == b2:
+                    continue
+                a, b = a2, b2
             tk.pending_qty = min(qty, self.truck_capacity)
             tk.collected, tk.visited, tk.overflow = 0, set(), False
             tk.route = tk.pair = None
@@ -381,7 +401,9 @@ class BikeShareEnv(gym.Env):
                 tk.busy_until = t + dur
             elif kind == "load":
                 want = tk.pending_qty - tk.collected if self.multi_stop else tk.pending_qty
-                if self.multi_stop:
+                if self.stop_rule is not None and tk.route is None:
+                    want = self.stop_rule.amount(self, st, True, want)
+                elif self.multi_stop:
                     want = min(want, self.max_bikes_per_stop)
                 n = int(max(0, min(want, self.bikes[st], self.truck_capacity - tk.load)))
                 self.bikes[st] -= n
@@ -424,7 +446,7 @@ class BikeShareEnv(gym.Env):
                         self._next_dropoff(tk, st)
                     continue
                 if self.multi_stop and not tk.overflow and st not in tk.visited:
-                    n = int(min(tk.load, cap, self.max_bikes_per_stop))
+                    n = int(min(tk.load, cap, self.max_bikes_per_stop)) if self.stop_rule is None                         else int(max(0, min(cap, self.stop_rule.amount(self, st, False, tk.load))))
                     tk.visited.add(st)
                     self.bikes[st] += n
                     tk.load -= n
@@ -463,9 +485,24 @@ class BikeShareEnv(gym.Env):
         if dest is not None:
             tk.ops.extend([("drive", dest), ("unload", dest)])
 
+    def _rule_stop(self, st: int, visited: set, pickup: bool, frm: int,
+                   first: bool = False) -> int | None:
+        """Best unvisited station of `st`'s zone under stop_rule, from station `frm`."""
+        cand = self._zone_members[int(self.station_zone[st])]
+        if visited:
+            cand = cand[~np.isin(cand, list(visited))]
+        if not len(cand):
+            return None
+        score = np.asarray(self.stop_rule.scores(self, cand, pickup, frm, first), float)
+        j = int(np.argmax(score))
+        return int(cand[j]) if np.isfinite(score[j]) else None
+
     def _next_stop(self, st: int, visited: set, pickup: bool) -> int | None:
         """Next multi-stop station in `st`'s zone: the unvisited one with the most
-        bikes (pickup) or the most free docks (drop-off); None if none qualifies."""
+        bikes (pickup) or the most free docks (drop-off); None if none qualifies.
+        With a stop_rule, the rule's best station from `st` instead."""
+        if self.stop_rule is not None:
+            return self._rule_stop(st, visited, pickup, frm=st)
         cand = self._zone_members[int(self.station_zone[st])]
         if visited:
             cand = cand[~np.isin(cand, list(visited))]

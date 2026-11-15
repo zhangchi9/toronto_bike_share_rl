@@ -178,7 +178,7 @@ POS6 = np.arange(6)
 DIST6 = np.abs(POS6[:, None] - POS6[None, :]).astype(float)
 
 
-def make_multi_env(bikes, capacity=(10,) * 6, max_per_stop=5):
+def make_multi_env(bikes, capacity=(10,) * 6, max_per_stop=5, stop_rule=None):
     stations = pd.DataFrame({
         "station_id": list(range(200, 206)),
         "lat": [43.65 + 0.01 * i for i in range(6)], "lon": [-79.38] * 6,
@@ -191,7 +191,7 @@ def make_multi_env(bikes, capacity=(10,) * 6, max_per_stop=5):
                        road_time_min=2 * DIST6, depot_station=200, number_trucks=1,
                        skip_when_all_busy=False, truck_capacity=40,
                        station_zone=np.array([0, 0, 0, 1, 1, 1]),
-                       max_bikes_per_stop=max_per_stop)
+                       max_bikes_per_stop=max_per_stop, stop_rule=stop_rule)
     env.reset(seed=0)
     env.bikes[:] = bikes
     return env
@@ -244,6 +244,76 @@ def test_multi_stop_full_dropoff_zone_falls_back_to_nearest_free():
     # 1 free dock at each of 3, 4, 5; the other 7 go to the nearest free dock (station 2).
     assert delta.tolist() == [-5, -5, 7, 1, 1, 1]
     assert env.trucks[0].load == 0 and env.totals["bikes_moved"] == 10
+
+
+def _rule(name):
+    from rl.stop_rules import parse_rule
+    return parse_rule(name)
+
+
+@pytest.mark.parametrize("bikes,qty", [([8, 6, 3, 0, 1, 2], 12), ([2, 1, 0, 0, 0, 0], 40),
+                                       ([8, 6, 3, 1, 1, 1], 10)])
+def test_stop_rule_most_cap5_is_the_builtin_rule(bikes, qty):
+    a, b = make_multi_env(bikes), make_multi_env(bikes, stop_rule=_rule("most/cap5"))
+    va, da = run_mission(a, pickup=0, dropoff=3, qty=qty)
+    vb, db = run_mission(b, pickup=0, dropoff=3, qty=qty)
+    assert va == vb and da.tolist() == db.tolist() and a.totals == b.totals
+
+
+def test_stop_rule_nearest_goes_to_the_nearest_station_next():
+    env = make_multi_env([8, 2, 6, 0, 0, 0], stop_rule=_rule("nearest/cap5"))
+    visits, delta = run_mission(env, pickup=2, dropoff=5, qty=12)
+    # First stop by most bikes (0, where the truck is), then nearest: 1 before 2.
+    assert visits[:2] == [1, 2] and delta[:3].tolist() == [-5, -2, -5]
+    assert delta[3:].tolist() == [5, 5, 2]                  # 3 (most free), then 4, 5
+
+
+def test_stop_rule_fill_picks_the_fullest_station_by_ratio():
+    env = make_multi_env([10, 9, 2, 0, 0, 0], capacity=(20, 10, 10, 10, 10, 10),
+                         stop_rule=_rule("fill/cap5"))
+    _, delta = run_mission(env, pickup=0, dropoff=3, qty=5)
+    assert delta[:3].tolist() == [0, -5, 0]                 # 9/10 beats 10/20
+
+
+def test_stop_rule_target_moves_stations_toward_half_full():
+    env = make_multi_env([8, 6, 3, 0, 4, 6], stop_rule=_rule("most/target"))
+    _, delta = run_mission(env, pickup=0, dropoff=3, qty=40)
+    # Pickup only above 5 of 10 docks: 3 from 0, 1 from 1; drop only up to 5.
+    assert delta.tolist() == [-3, -1, 0, 4, 0, 0]
+    assert ((env.bikes[:3] >= 5) | (delta[:3] == 0)).all()
+
+
+def test_stop_rule_target_skips_a_zone_with_nothing_above_half():
+    env = make_multi_env([5, 4, 3, 0, 0, 0], stop_rule=_rule("most/target"))
+    visits, delta = run_mission(env, pickup=0, dropoff=3, qty=20)
+    assert visits == [] and not delta.any() and env.totals["truck_km"] == 0
+
+
+def test_stop_rule_cap10_moves_at_most_10_per_station():
+    env = make_multi_env([12, 6, 3, 0, 0, 0], stop_rule=_rule("most/cap10"))
+    _, delta = run_mission(env, pickup=0, dropoff=3, qty=20)
+    assert delta.tolist() == [-10, -6, -3, 10, 9, 0]
+    assert np.abs(delta).max() <= 10 and env.trucks[0].load == 0
+
+
+def test_stop_rule_never_moves_more_than_ordered():
+    for name in ("most/cap10", "need/cap5", "fill/target", "need_near/target"):
+        env = make_multi_env([10, 10, 10, 0, 0, 0], stop_rule=_rule(name))
+        _, delta = run_mission(env, pickup=0, dropoff=3, qty=7)
+        assert -delta[:3].sum() <= 7 and delta.sum() == 0, name
+
+
+def test_stop_rule_not_allowed_with_paired_trucks():
+    kw = dict(init_occupancy=0.0, simulation_period=("2026-06-15", "2026-06-15"),
+              stations=pd.DataFrame({"station_id": [1, 2], "lat": [43.6, 43.7],
+                                     "lon": [-79.4, -79.4], "capacity": [10, 10]}),
+              trips=TripEvents.from_frame(pd.DataFrame(
+                  [], columns=["start_min", "end_min", "start_idx", "end_idx", "rent_min"])),
+              road_dist_km=np.ones((2, 2)), road_time_min=np.ones((2, 2)),
+              station_zone=np.array([0, 1]), max_bikes_per_stop=5, paired_trucks=True,
+              number_trucks=2, stop_rule=_rule("need/cap5"))
+    with pytest.raises(ValueError):
+        BikeShareEnv(**kw)
 
 
 def test_multi_stop_needs_both_settings():

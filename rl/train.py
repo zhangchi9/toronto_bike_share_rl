@@ -16,6 +16,8 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from rl import zones as zz
+from rl.features import CHAMPION_FEATURES, features_name, parse_features
+from rl.stop_rules import parse_rule, rule_name
 from rl.wrapper import VAL_WINDOWS, RebalanceEnv
 
 POLICY_KWARGS = {"net_arch": [256, 256]}
@@ -26,9 +28,11 @@ def model_dir(algo: str, trucks: int) -> str:
     return os.path.join("models", f"{algo}_{trucks}trucks")
 
 
-def _make_env(trucks: int, seed: int, zone_scheme: str | None = None):
+def _make_env(trucks: int, seed: int, zone_scheme: str | None = None, features=None,
+              stop_rule=None):
     def thunk():
-        env = Monitor(RebalanceEnv(number_trucks=trucks, zone_scheme=zone_scheme))
+        env = Monitor(RebalanceEnv(number_trucks=trucks, zone_scheme=zone_scheme,
+                                   features=features, stop_rule=stop_rule))
         env.reset(seed=seed)
         return env
     return thunk
@@ -38,17 +42,18 @@ EXPLORATION_STEPS = 200_000   # DQN: epsilon decays 1 -> 0.02 over this many dec
 
 
 def build_model(algo: str, trucks: int, seed: int, n_envs: int, timesteps: int = 1_000_000,
-                zone_scheme: str | None = None):
+                zone_scheme: str | None = None, features=None, stop_rule=None):
     common = dict(policy="MlpPolicy", gamma=GAMMA, policy_kwargs=POLICY_KWARGS,
                   seed=seed, device="cpu", verbose=0, tensorboard_log="runs")
     if algo == "dqn":
-        venv = DummyVecEnv([_make_env(trucks, seed, zone_scheme)])
+        venv = DummyVecEnv([_make_env(trucks, seed, zone_scheme, features, stop_rule)])
         return DQN(env=venv, buffer_size=200_000, learning_starts=20_000,
                    batch_size=256, learning_rate=1e-4, train_freq=4,
                    target_update_interval=10_000,
                    exploration_fraction=min(1.0, EXPLORATION_STEPS / timesteps),
                    exploration_final_eps=0.02, **common)
-    venv = SubprocVecEnv([_make_env(trucks, seed + i, zone_scheme) for i in range(n_envs)])
+    venv = SubprocVecEnv([_make_env(trucks, seed + i, zone_scheme, features, stop_rule)
+                          for i in range(n_envs)])
     if algo == "ppo":
         return PPO(env=venv, n_steps=2048, batch_size=256, ent_coef=0.01, **common)
     if algo == "a2c":
@@ -68,17 +73,26 @@ def main():
                    help="model folder (default models/<algo>_<k>trucks_<zones>)")
     p.add_argument("--zones", default=None,
                    help="zone scheme, e.g. flow_w0.5 (default: zones.ZONE_SCHEME)")
+    p.add_argument("--features", default=CHAMPION_FEATURES,
+                   help="extra feature groups, e.g. risk+travel, or none for the round 8 "
+                        "inputs (default: rl.features.CHAMPION_FEATURES, all four groups)")
+    p.add_argument("--stop-rule", default=None,
+                   help="station rule inside zones, e.g. need/cap5 (rl.stop_rules.RULES; "
+                        "default: the round 3 rule)")
     args = p.parse_args()
 
     torch.set_num_threads(2)
-    out = args.out or f"{model_dir(args.algo, args.trucks)}_{args.zones or zz.ZONE_SCHEME}"
+    out = args.out or (f"{model_dir(args.algo, args.trucks)}_{args.zones or zz.ZONE_SCHEME}"
+                       + (f"_{features_name(args.features)}" if parse_features(args.features) else "")
+                       + (f"_{rule_name(args.stop_rule)}" if parse_rule(args.stop_rule) else ""))
     os.makedirs(out, exist_ok=True)
     model = build_model(args.algo, args.trucks, args.seed, args.n_envs, args.timesteps,
-                        args.zones)
+                        args.zones, args.features, args.stop_rule)
     n_envs = model.get_env().num_envs
 
     eval_env = Monitor(RebalanceEnv(number_trucks=args.trucks, windows=VAL_WINDOWS,
-                                    zone_scheme=args.zones))
+                                    zone_scheme=args.zones, features=args.features,
+                                    stop_rule=args.stop_rule))
     callback = EvalCallback(eval_env, n_eval_episodes=len(VAL_WINDOWS), deterministic=True,
                             eval_freq=max(1, args.eval_every // n_envs),
                             best_model_save_path=out, log_path=out, verbose=1)

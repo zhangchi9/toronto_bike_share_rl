@@ -229,3 +229,163 @@ def test_forecast_features_use_only_trips_before_the_origin():
             assert np.array_equal(X[row * Z:(row + 1) * Z], X2)
         y = fc.targets(cum(counts), origins, H)  # target = the next H minutes
         assert y[0] == counts[origins[0]:origins[0] + H, 0].sum()
+
+
+# ── round 9: extra feature groups ────────────────────────────────────────────
+ALL_FEATURES = "risk+travel+failures+memory"
+
+
+def test_feature_groups_parse_and_size():
+    from rl.features import FEATURE_GROUPS, features_name, parse_features
+    assert parse_features(None) == parse_features("base") == ()
+    assert parse_features("memory,risk") == ("risk", "memory")
+    assert features_name(["travel", "risk"]) == "risk+travel"
+    with pytest.raises(ValueError):
+        parse_features("risk+weather")
+    base = obs_size(21, 1)
+    assert obs_size(21, 1, features="risk") == base + 6 * 21
+    assert obs_size(21, 1, features=ALL_FEATURES) == base + 11 * 21
+    assert FEATURE_GROUPS == ("risk", "travel", "failures", "memory")
+
+
+def test_champion_features_are_all_four_groups():
+    from rl.features import CHAMPION_FEATURES, FEATURE_GROUPS, parse_features
+    assert parse_features(CHAMPION_FEATURES) == FEATURE_GROUPS
+
+
+def test_feature_obs_extends_base_obs_and_stays_in_bounds():
+    base = RebalanceEnv(number_trucks=1, windows=WINDOW)
+    full = RebalanceEnv(number_trucks=1, windows=WINDOW, features=ALL_FEATURES)
+    ob, _ = base.reset(seed=0)
+    of, _ = full.reset(seed=0)
+    assert of.shape == full.observation_space.shape
+    rng = np.random.default_rng(1)
+    done = False
+    while not done:
+        assert np.array_equal(of[:len(ob)], ob)          # base inputs unchanged, extras last
+        assert full.observation_space.contains(of)
+        a = int(rng.integers(base.action_space.n)) if rng.random() < 0.05 else 0
+        ob, _, done, *_ = base.step(a)
+        of, _, done_f, *_ = full.step(a)
+        assert done == done_f
+
+
+def test_failure_features_count_every_lost_request_and_blocked_return():
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, features="failures")
+    env.reset(seed=0)
+    fb, seen = env.fb, []
+    record = fb.record
+    fb.record = lambda: (record(), seen.append(fb.failures[-1]))
+    done = False
+    while not done:
+        _, _, done, *_ = env.step(0)
+    tot = np.sum(seen, axis=0)
+    assert tot[0].sum() == env.env.totals["lost_trips"] > 0
+    assert tot[1].sum() == env.env.totals["overflow_returns"] > 0
+
+
+def test_memory_features_remember_the_last_order():
+    from rl.features import MEMORY_MIN, encode_action, truck_zones
+    from rl.wrapper import static_data
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, features="memory")
+    obs, _ = env.reset(seed=0)
+    Z = env.zones.n_zones
+    assert np.all(obs[-2 * Z:] == 1)                        # never visited
+    tz = truck_zones(env.zones, static_data()["ids"])
+    src, dst = int(tz[10]), int(tz[5])
+    row = env.fb.decode(encode_action(10, 5, 20, len(tz)))
+    t0 = env.env.t
+    obs, *_ = env.step(encode_action(10, 5, 20, len(tz)))
+    zof = env.zones.zone_of_station
+    assert zof[row[0] - 1] == src and zof[row[1]] == dst
+    pick, drop = obs[-2 * Z:-Z], obs[-Z:]
+    assert pick[src] == pytest.approx(min(1, (env.env.t - t0) / MEMORY_MIN))
+    assert drop[dst] == pytest.approx(min(1, (env.env.t - t0) / MEMORY_MIN))
+    assert pick[src] < 1 and np.sum(pick < 1) == 1 and np.sum(drop < 1) == 1
+
+
+def test_feature_obs_same_on_dashboard_and_in_wrapper(monkeypatch):
+    """With every feature group, the dashboard path builds the same inputs."""
+    import rl.policy as rp
+    from bikeshare_env.rollout import simulate_day
+
+    class Scripted:
+        def __init__(self):
+            self.seen = []
+
+        def predict(self, obs, deterministic=True):
+            self.seen.append(np.array(obs))
+            return (7 if len(self.seen) % 97 == 0 else 0), None
+
+    cls = type("ScriptedFeat", (rp.RLPolicy,), {"label": "t", "algo": "dqn", "path": "",
+                                                "number_trucks": 1, "zone_scheme": None,
+                                                "features": ("risk", "travel", "failures",
+                                                             "memory")})
+    cls._model = Scripted()
+    monkeypatch.setitem(rp.POLICIES, "scripted_feat", cls)
+    simulate_day("2026-07-18", "scripted_feat")
+
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, features=ALL_FEATURES)
+    obs, _ = env.reset(seed=0)
+    model, done = Scripted(), False
+    while not done:
+        a, _ = model.predict(obs)
+        obs, _, done, *_ = env.step(a)
+    assert len(model.seen) == len(cls._model.seen)
+    assert all(np.array_equal(a, b) for a, b in zip(model.seen, cls._model.seen))
+
+
+def test_stop_rules_parse():
+    from rl.stop_rules import RULES, parse_rule, rule_name
+    assert parse_rule(None) is None and parse_rule("none") is None
+    for r in RULES:
+        assert parse_rule(r).name == r == parse_rule(rule_name(r)).name
+    assert rule_name("need_near/target") == "need_near-target"
+    for bad in ("need", "most/cap7", "best/cap5"):
+        with pytest.raises(ValueError):
+            parse_rule(bad)
+
+
+def test_need_rule_projects_with_training_period_profiles(env):
+    from rl.features import _profiles_bikes
+    from rl.stop_rules import parse_rule
+    from rl.zones import demand_profiles
+    e = env.env
+    rule = parse_rule("need/cap5")
+    cand = np.arange(10)
+    P = demand_profiles(e.station_ids, e.capacity.astype(float)) * e.capacity[:, None]
+    assert np.allclose(_profiles_bikes(e.station_ids, e.capacity), P)
+    h = (e.t % 1440) // 60
+    off = int(e.start_date.dayofweek >= 5)             # the WINDOW has no holidays
+    want = e.bikes[cand] + P[cand][:, [h + 24 * off, (h + 1) % 24 + 24 * off]].sum(1)
+    assert np.allclose(rule.projected(e, cand), want)
+
+
+def test_stop_rule_same_on_dashboard_and_in_wrapper(monkeypatch):
+    """A non-default station rule gives the same run on the dashboard path."""
+    import rl.policy as rp
+    from bikeshare_env.rollout import simulate_day
+
+    class Scripted:
+        def __init__(self):
+            self.seen = []
+
+        def predict(self, obs, deterministic=True):
+            self.seen.append(np.array(obs))
+            return (7 if len(self.seen) % 97 == 0 else 0), None
+
+    cls = type("ScriptedRule", (rp.RLPolicy,), {"label": "t", "algo": "dqn", "path": "",
+                                                "number_trucks": 1, "zone_scheme": None,
+                                                "stop_rule": "need_near/target"})
+    cls._model = Scripted()
+    monkeypatch.setitem(rp.POLICIES, "scripted_rule", cls)
+    simulate_day("2026-07-18", "scripted_rule")
+
+    env = RebalanceEnv(number_trucks=1, windows=WINDOW, stop_rule="need_near/target")
+    obs, _ = env.reset(seed=0)
+    model, done = Scripted(), False
+    while not done:
+        a, _ = model.predict(obs)
+        obs, _, done, *_ = env.step(a)
+    assert len(model.seen) == len(cls._model.seen)
+    assert all(np.array_equal(a, b) for a, b in zip(model.seen, cls._model.seen))

@@ -56,20 +56,21 @@ def route_ends(scheme: str):
     return tz, src, dst
 
 
-def _env(scheme):
+def _env(scheme, stop_rule=None):
     from rl.wrapper import TRAIN_RANGE, RebalanceEnv
     env = RebalanceEnv(number_trucks=1, windows=[TRAIN_RANGE], zone_scheme=scheme,
-                       forecast=False)
+                       forecast=False, stop_rule=stop_rule)
     env.reset(seed=0)
     return env
 
 
 def run_route(args) -> dict:
-    """Gain over no trucks of repeating one order over the training period."""
-    scheme, src, dst, qty = args
+    """Gain over no trucks of repeating one order over the training period.
+    args = (scheme, src, dst, qty[, stop_rule])."""
+    scheme, src, dst, qty, *rule = args
     from rl.features import encode_action, truck_zones
     from rl.wrapper import static_data
-    env = _env(scheme)
+    env = _env(scheme, *rule)
     tz = list(truck_zones(env.zones, static_data()["ids"]))
     a = encode_action(tz.index(src), tz.index(dst), qty, len(tz))
     done, info = False, {}
@@ -81,14 +82,14 @@ def run_route(args) -> dict:
             "bikes_moved": int(T["bikes_moved"])}
 
 
-def run_greedy(scheme) -> dict:
+def run_greedy(scheme, stop_rule=None) -> dict:
     """Gain over no trucks of the surplus -> shortage greedy dispatcher."""
     from rl import forecast as fc
     from rl.features import encode_action, truck_zones
     from rl.wrapper import TRAIN_RANGE, static_data
     s = static_data()
     cap = s["stations"]["capacity"].to_numpy(float)
-    env = _env(scheme)
+    env = _env(scheme, stop_rule)
     zof, Z = env.zones.zone_of_station, env.zones.n_zones
     tz = truck_zones(env.zones, s["ids"])
     docks = np.bincount(zof, weights=cap, minlength=Z)[tz]

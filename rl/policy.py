@@ -29,12 +29,14 @@ class ZoneActionPolicy(Policy):
     paired = False          # both trucks run every order together (env paired_trucks)
     forecast = True         # round-4 demand forecast features in the observation
     zone_scheme = None      # None = zones.ZONE_SCHEME (what the agents were trained on)
+    features = ()           # round-9 extra feature groups (rl.features.FEATURE_GROUPS)
+    stop_rule = None        # round-10 station rule (rl.stop_rules; None = round 3 rule)
 
     @classmethod
     def env_kwargs(cls) -> dict:
         kw = super().env_kwargs()
         if cls.multi_stop:
-            kw.update(multi_stop_kwargs(cls.zone_scheme))
+            kw.update(multi_stop_kwargs(cls.zone_scheme, cls.stop_rule))
         if cls.paired:
             kw["paired_trucks"] = True
         return kw
@@ -42,7 +44,8 @@ class ZoneActionPolicy(Policy):
     def reset(self, env) -> None:
         super().reset(env)
         self.env = env
-        self.fb = FeatureBuilder(env, zz.load_zones(self.zone_scheme), forecast=self.forecast)
+        self.fb = FeatureBuilder(env, zz.load_zones(self.zone_scheme), forecast=self.forecast,
+                                 features=self.features)
         self.fb.reset()
         self.first = True
 
@@ -58,6 +61,7 @@ class ZoneActionPolicy(Policy):
             if tk.busy(self.env.t):
                 continue
             action[k] = self.fb.decode(self.choose(self.fb.obs(k)))
+            self.fb.note(k, action[k])
         return action
 
 

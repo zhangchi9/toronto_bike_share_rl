@@ -19,7 +19,9 @@ from bikeshare_env.road_network import load_road_matrices
 from bikeshare_env.trips import load_period_trips
 from data_loader import load_stations
 from rl import zones as zz
+from rl.stop_rules import parse_rule
 from rl.features import (MAX_BIKES_PER_STOP, TRUCK_CAPACITY, FeatureBuilder, n_actions,
+                         parse_features,
                          obs_size, truck_zones)
 
 # Data split. Validation (checkpoint selection) is the end of the training months;
@@ -44,22 +46,23 @@ def static_data() -> dict:
     return _static
 
 
-def multi_stop_kwargs(zone_scheme: str | None = None) -> dict:
-    """Env settings for multi-stop missions over the RL zones (round 3 rule)."""
+def multi_stop_kwargs(zone_scheme: str | None = None, stop_rule=None) -> dict:
+    """Env settings for multi-stop missions over the RL zones (round 3 rule), with
+    an optional round 10 station rule (rl.stop_rules; None = the round 3 rule)."""
     return {"station_zone": zz.load_zones(zone_scheme).zone_of_station,
-            "max_bikes_per_stop": MAX_BIKES_PER_STOP}
+            "max_bikes_per_stop": MAX_BIKES_PER_STOP, "stop_rule": parse_rule(stop_rule)}
 
 
 def make_base_env(window, number_trucks, init_occupancy, trips=None,
                   multi_stop: bool = True, paired_trucks: bool = False,
-                  zone_scheme: str | None = None) -> BikeShareEnv:
+                  zone_scheme: str | None = None, stop_rule=None) -> BikeShareEnv:
     s = static_data()
     if trips is None:
         trips = load_period_trips(window[0], window[1], s["ids"])
     return BikeShareEnv(init_occupancy=init_occupancy, simulation_period=window,
                         number_trucks=number_trucks, skip_when_all_busy=False,
                         truck_capacity=TRUCK_CAPACITY,
-                        **(multi_stop_kwargs(zone_scheme) if multi_stop else {}),
+                        **(multi_stop_kwargs(zone_scheme, stop_rule) if multi_stop else {}),
                         paired_trucks=paired_trucks,
                         stations=s["stations"], trips=trips,
                         road_dist_km=s["dist"], road_time_min=s["time"])
@@ -87,7 +90,7 @@ class RebalanceEnv(gym.Env):
                  init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
                  reward_scale: float = 10.0, zone_scheme: str | None = None,
                  record_minutes: bool = False, multi_stop: bool = True,
-                 forecast: bool = True):
+                 forecast: bool = True, features=None, stop_rule=None):
         """`windows`: fixed list of (start, end) episodes, used in order (eval/test).
         Otherwise each episode is a random `episode_days` window in `sample_range`."""
         super().__init__()
@@ -102,6 +105,8 @@ class RebalanceEnv(gym.Env):
         self.record_minutes = record_minutes   # keep each minute's true reward (eval)
         self.multi_stop = multi_stop           # round-3 multi-stop missions (5 bikes/stop)
         self.forecast = forecast               # round-4 demand forecast features
+        self.features = parse_features(features)   # round-9 extra feature groups
+        self.stop_rule = parse_rule(stop_rule)      # round-10 station rule (None = round 3)
         self.zone_scheme = zone_scheme or zz.ZONE_SCHEME
         self.zones = zz.load_zones(self.zone_scheme)
         self._next_window = 0
@@ -110,7 +115,8 @@ class RebalanceEnv(gym.Env):
         n_truck_zones = len(truck_zones(self.zones, static_data()["ids"]))
         self.action_space = spaces.Discrete(n_actions(n_truck_zones))
         self.observation_space = spaces.Box(
-            -1.0, 1.0, (obs_size(self.zones.n_zones, self.K, forecast),), np.float32)
+            -1.0, 1.0, (obs_size(self.zones.n_zones, self.K, forecast, self.features),),
+            np.float32)
         self.env: BikeShareEnv | None = None
 
     # ── episode setup ────────────────────────────────────────────────────────
@@ -130,11 +136,13 @@ class RebalanceEnv(gym.Env):
         self.window = self._pick_window()
         trips = load_period_trips(*self.window, static_data()["ids"])
         self.env = make_base_env(self.window, self.K, self.init_occupancy, trips,
-                                 multi_stop=self.multi_stop, zone_scheme=self.zone_scheme)
+                                 multi_stop=self.multi_stop, zone_scheme=self.zone_scheme,
+                                 stop_rule=self.stop_rule)
         self.env.reset(seed=0)
         self.base = no_truck_rewards(self.window, self.init_occupancy, trips)
         self.fleet_daily = self.K * (self.env.truck_fixed_cost + self.env.shift_cost)
-        self.fb = FeatureBuilder(self.env, self.zones, forecast=self.forecast)
+        self.fb = FeatureBuilder(self.env, self.zones, forecast=self.forecast,
+                                 features=self.features)
         self.fb.reset()
         self.true_total = 0.0
         self.minute_rewards: list[float] = []
@@ -172,6 +180,7 @@ class RebalanceEnv(gym.Env):
     def step(self, action):
         k = self.queue.pop(0)
         self.pending[k] = self.fb.decode(action)
+        self.fb.note(k, self.pending[k])
         if self.queue:                         # another idle truck, same minute
             return self.fb.obs(self.queue[0]), 0.0, False, False, self._info()
         reward = self._sim_minute(self.pending)
