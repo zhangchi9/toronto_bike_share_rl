@@ -1,0 +1,80 @@
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: sans-serif; background: #f4f4f4; color: #1a1a2e; }
+
+#header {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px;
+  padding: 10px 16px; background: #1a1a2e; color: #ccc; position: relative; z-index: 2000;
+}
+#header .brand { font-weight: bold; font-size: 18px; color: #fff; margin-right: 8px; }
+#header .hl { display: flex; align-items: center; gap: 6px; }
+#header input[type=date], #header select {
+  font: inherit; font-size: 14px; padding: 4px 6px; border: 1px solid #ccc;
+  border-radius: 4px; background: #fff; color: #1a1a2e;
+}
+#policy-select { max-width: 300px; }
+#header .dash { color: #ccc; }
+#total-trips { color: #aaffaa; font-size: 14px; }
+.zone-toggle { color: #eee; font-size: 14px; cursor: pointer; }
+#time-display { color: #ffff88; font-size: 15px; font-weight: bold;
+                font-variant-numeric: tabular-nums; }
+
+#map-wrap { position: relative; background: #fff; }
+#map { height: 60vh; min-height: 320px; }
+#loading {
+  position: absolute; top: 10px; left: 10px; z-index: 1001; padding: 4px 10px;
+  background: rgba(26,26,46,0.85); color: #fff; border-radius: 4px; font-size: 13px;
+  display: none;
+}
+.legend {
+  position: absolute; top: 10px; right: 10px; z-index: 1000;
+  background: rgba(255,255,255,0.88); border: 1px solid #ccc; border-radius: 4px;
+  padding: 8px 10px; font-size: 12px;
+}
+.legend summary { cursor: pointer; font-weight: bold; color: #555; }
+.legend[open] summary { margin-bottom: 4px; }
+.legend .lg-title { font-weight: bold; margin-bottom: 4px; }
+.legend hr { margin: 4px 0; border: 0; border-top: 1px solid #ccc; }
+
+#metrics {
+  display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 20px;
+  border-top: 1px solid #ddd;
+}
+.card {
+  flex: 1 1 140px; background: #fff; border: 1px solid #ddd; border-radius: 6px;
+  padding: 8px 12px; min-width: 0;
+}
+.card .lbl { font-size: 12px; color: #666; }
+.card .val { font-size: 20px; font-weight: bold; font-variant-numeric: tabular-nums;
+             overflow-wrap: anywhere; }
+
+#controls { padding: 10px 20px; border-top: 1px solid #ddd; }
+#controls .row { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
+#controls select { font: inherit; font-size: 14px; padding: 4px 6px; margin-left: 6px; }
+#play-btn {
+  padding: 7px 18px; font-weight: bold; cursor: pointer; border: 1px solid #999;
+  border-radius: 4px; background: #fff; font-size: 14px;
+}
+#slider-scroll { overflow-x: auto; overflow-y: hidden; padding: 30px 12px 4px; }
+#slider-inner { position: relative; padding: 0 28px; }
+#time-slider { width: 100%; margin: 0; display: block; }
+#slider-marks { position: relative; height: 22px; margin: 4px 9px 0; }
+#slider-marks span {
+  position: absolute; transform: translateX(-50%); white-space: nowrap;
+  font-size: 11px; color: #777;
+}
+#slider-marks span.date { font-weight: bold; font-size: 13px; color: #1a1a2e; }
+#slider-tip {
+  position: absolute; top: -26px; transform: translateX(-50%); white-space: nowrap;
+  background: #1a1a2e; color: #fff; font-size: 12px; padding: 2px 6px; border-radius: 3px;
+  pointer-events: none;
+}
+.note { font-size: 12px; color: #666; margin: 6px 0 0; }
+.note a { color: #1f4fd1; }
+
+@media (max-width: 600px) {
+  #header { padding: 8px 16px; }
+  #controls, #metrics { padding-left: 16px; padding-right: 16px; }
+  .legend { font-size: 11px; padding: 6px 8px; }
+  #map { height: 55vh; }
+}
