@@ -5,9 +5,16 @@ models/<algo>_<k>trucks/best_model.zip (e.g. "ppo_2trucks") into POLICIES.
 Decisions follow the training rule exactly: every minute, each idle truck is
 asked in order; busy trucks are skipped.
 
-Also registers "fix_shuttle_policy": the fixed route the 1-truck PPO/A2C agents
-converged to, written as a plain rule (no learning), and "dqn_duplicated_2trucks":
-two trucks driven by the 1-truck DQN as one (paired trucks).
+Since 2026-11-17 the dashboard shows 5 solutions only (DASHBOARD_POLICIES):
+  no_rebalancing          no trucks
+  fix_shuttle_policy      the fixed route the 1-truck PPO/A2C agents converged to,
+                          written as a plain rule (no learning), 1 truck
+  dqn_1truck              the round 9 champion DQN (seed 2: best S1 validation, round 14)
+  dqn_planner_1truck      the round 13 lookahead planner on that same DQN (the champion)
+  dqn_territory_2trucks   round 12's territory pair, seed 2 (best validation): one DQN
+                          per half of the city
+The older policies (PPO / A2C / DQN on the round 5 zones, the duplicated DQN, the
+2-truck shuttle) stay defined here but are no longer registered.
 """
 import os
 
@@ -150,9 +157,110 @@ class FixShuttlePolicy2Trucks(FixShuttlePolicy):
     number_trucks = 2
 
 
-# Dropdown order: No trucks, shuttle x2, then PPO / A2C / DQN x (1, 2) trucks.
-POLICIES["fix_shuttle_policy"] = FixShuttlePolicy
-POLICIES["fix_shuttle_policy_2trucks"] = FixShuttlePolicy2Trucks
-register_trained_models()
-if os.path.exists(DuplicatedTruckPolicy.path):
-    POLICIES["dqn_duplicated_2trucks"] = DuplicatedTruckPolicy
+# ── the dashboard's current solutions (2026-11-17) ────────────────────────────
+CHAMP_SEED = 2          # champion seed with the best S1 validation (round 14)
+CHAMP_ZONES = "flow_w0.3_k20_need"
+CHAMP_FEATURES = "risk+travel+failures+memory"
+TERRITORY_ZONES = "flow_w0.3_k40_need"
+TERRITORY_SEED = 2      # round 12 pair with the best validation
+
+
+class ChampionDQNPolicy(RLPolicy):
+    """The round 9 champion DQN on its own (1 truck, 20 zones, all four feature groups)."""
+    label = "DQN (1 truck)"
+    algo = "dqn"
+    path = os.path.join("models", "round9", f"dqn_1trucks_{CHAMP_FEATURES}_s{CHAMP_SEED}",
+                        "best_model.zip")
+    number_trucks = 1
+    zone_scheme = CHAMP_ZONES
+    features = CHAMP_FEATURES
+    _model = None
+
+
+class PlannerPolicy(ChampionDQNPolicy):
+    """Round 13's lookahead planner on the champion DQN, with its tuned settings
+    (results/round13/planner_best.json). Slow: each order tries the DQN's 8 best
+    orders against 6 past-day scenarios for 24 hours."""
+    label = "DQN + lookahead planner (1 truck)"
+
+    def reset(self, env) -> None:
+        import json
+        from types import SimpleNamespace
+
+        import pandas as pd
+
+        from rl.planner import Planner, ScenarioBank
+        from rl.wrapper import static_data
+        super().reset(env)
+        best = json.load(open(os.path.join("results", "round13", "planner_best.json")))
+        end = env.start_date + pd.Timedelta(days=env.n_days - 1)
+        real = SimpleNamespace(            # what Planner reads from a 1-truck RebalanceEnv
+            env=env, fbs=[self.fb], window=(str(env.start_date.date()), str(end.date())),
+            K=1, init_occupancy=env.init_occupancy, zone_scheme=self.zone_scheme,
+            stop_rule=self.stop_rule, zones=self.fb.z, forecast=self.forecast,
+            features=self.fb.features, reward_scale=10.0)
+        self.planner = Planner(self.model(), real, ScenarioBank(static_data()["ids"]),
+                               k=best["k"], s=best["s"], horizon=best["horizon"],
+                               value_weight=best["value_weight"],
+                               seed=CHAMP_SEED)   # scenario draws as in round 13's test
+
+    def choose(self, obs_vector):
+        return self.planner.act(obs_vector)
+
+
+class TerritoryPairPolicy(ZoneActionPolicy):
+    """Round 12: truck 0 driven by territory A's DQN, truck 1 by territory B's. Each
+    sees only its own zones plus one outside zone, and orders moves inside them."""
+    label = "DQN (2 trucks, one territory each)"
+    number_trucks = 2
+    zone_scheme = TERRITORY_ZONES
+    features = CHAMP_FEATURES
+    paths = [os.path.join("models", "round12", f"dqn_1trucks_territory{t}_s{TERRITORY_SEED}",
+                          "best_model.zip") for t in "AB"]
+    path = paths[0]         # dashboard_data's fingerprint (rebuild when retrained)
+    _models = None
+
+    def reset(self, env) -> None:
+        Policy.reset(self, env)
+        from rl.territory import load_territories, territory_view
+        self.env = env
+        zones = zz.load_zones(self.zone_scheme)
+        terr = load_territories(self.zone_scheme)
+        self.fbs = [FeatureBuilder(env, territory_view(zones, t), forecast=self.forecast,
+                                   features=self.features, action_zone_ids=np.arange(len(t)),
+                                   others=False, forecast_zones=zones) for t in terr]
+        for fb in self.fbs:
+            fb.reset()
+        self.first = True
+        if TerritoryPairPolicy._models is None:
+            from stable_baselines3 import DQN
+            TerritoryPairPolicy._models = [DQN.load(p, device="cpu") for p in self.paths]
+
+    def act(self, obs, info):
+        if not self.first:
+            for fb in self.fbs:
+                fb.record()
+        self.first = False
+        action = np.zeros((self.number_trucks, 3), dtype=np.int64)
+        for k, tk in enumerate(self.env.trucks):
+            if tk.busy(self.env.t):
+                continue
+            fb = self.fbs[k]
+            a = int(self._models[k].predict(fb.obs(k), deterministic=True)[0])
+            action[k] = fb.decode(a)
+            fb.note(k, action[k])
+        return action
+
+
+# Dropdown order (no_rebalancing is first, from bikeshare_env.policies).
+DASHBOARD_POLICIES = {
+    "fix_shuttle_policy": FixShuttlePolicy,
+    "dqn_1truck": ChampionDQNPolicy,
+    "dqn_planner_1truck": PlannerPolicy,
+    "dqn_territory_2trucks": TerritoryPairPolicy,
+}
+for _key, _cls in DASHBOARD_POLICIES.items():
+    if getattr(_cls, "path", "") and not os.path.exists(_cls.path):
+        print(f"dashboard: {_key} skipped, {_cls.path} not found")
+        continue
+    POLICIES[_key] = _cls

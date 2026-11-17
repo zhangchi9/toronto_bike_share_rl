@@ -26,7 +26,7 @@ class Policy:
 
 class NoRebalancingPolicy(Policy):
     """Dummy baseline: never hires a truck or dispatches a mission."""
-    label = "No trucks (dummy)"
+    label = "No trucks"
     number_trucks = 0   # hires no trucks, so pays no truck costs
 
     def act(self, obs, info):

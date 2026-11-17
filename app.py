@@ -11,6 +11,8 @@ Usage:
     python -m dashboard_data         # once, and after retraining (about 2 min)
     python app.py                    # http://localhost:8050
 """
+import json
+import os
 import threading
 
 import pandas as pd
@@ -18,7 +20,6 @@ from dash import Dash, ctx, dcc, html, Input, Output, State, no_update
 
 import dashboard_data as dd           # also adds the trained RL models to POLICIES
 from bikeshare_env.env import MINUTES_PER_DAY
-from bikeshare_env.policies import POLICIES
 from data_loader import load_stations
 
 # ── Globals ───────────────────────────────────────────────────────────────────
@@ -30,11 +31,22 @@ DEFAULT_RANGE = ("2026-08-01", "2026-08-07")
 DEFAULT_POLICY = "no_rebalancing"
 
 # RL zones (rl/zones.py) drawn as an optional overlay: outline + centre label.
-try:
+ZONES_JSON = os.path.join(dd.REPLAY_DIR, "zones.json")   # view-only copy (deploy/)
+
+
+def zone_store() -> list:
     from rl.wrapper import static_data
     from rl.zones import zone_outlines
-    _ZONE_STORE = zone_outlines(static_data()["zones"], STATIONS_DF["lat"],
-                                STATIONS_DF["lon"], STATIONS_DF["capacity"])
+    return zone_outlines(static_data()["zones"], STATIONS_DF["lat"],
+                         STATIONS_DF["lon"], STATIONS_DF["capacity"])
+
+
+try:
+    if dd.VIEW_ONLY:
+        with open(ZONES_JSON, encoding="utf-8") as f:
+            _ZONE_STORE = json.load(f)
+    else:
+        _ZONE_STORE = zone_store()
 except Exception as e:   # noqa: BLE001 - overlay is optional
     print(f"Zone overlay disabled: {e}")
     _ZONE_STORE = []
@@ -397,6 +409,10 @@ def metric_card(card_id: str, label: str) -> html.Div:
 
 # ── App layout ────────────────────────────────────────────────────────────────
 app = Dash(__name__, title="Bike Share Toronto")
+server = app.server             # for gunicorn (the Hugging Face Space)
+if dd.VIEW_ONLY:                # behind the Space's https proxy: build https:// sprite URLs
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    server.wsgi_app = ProxyFix(server.wsgi_app, x_proto=1, x_host=1)
 
 def serve_layout():
     from flask import has_request_context, request
@@ -427,10 +443,14 @@ def serve_layout():
                 html.Span("Policy:", style={"color":"#ccc","marginLeft":"16px"}),
                 dcc.Dropdown(
                     id="policy-select",
-                    options=[{"label": cls.label, "value": key}
-                             for key, cls in POLICIES.items()],
+                    # A policy whose replay isn't built yet (e.g. the slow planner,
+                    # python -m dashboard_data) is greyed out until the page is reloaded.
+                    options=[{"label": label if dd.is_current(key)
+                              else f"{label} (replay not built yet)",
+                              "value": key, "disabled": not dd.is_current(key)}
+                             for key, label in dd.policies().items()],
                     value=DEFAULT_POLICY, clearable=False,
-                    style={"width":"230px"},
+                    style={"width":"300px"},
                 ),
                 dcc.Loading(
                     html.Div(id="total-trips",
@@ -696,10 +716,12 @@ app.clientside_callback(
 
 
 if __name__ == "__main__":
-    print("Loading the replay for", POLICIES[DEFAULT_POLICY].label, "...")
+    print("Loading the replay for", dd.policies()[DEFAULT_POLICY], "...")
     dd.load(DEFAULT_POLICY)
-    print("Loading road network for truck routes ...")
-    from road_routes import get_router
-    get_router()
-    print("Starting Dash at http://localhost:8050")
-    app.run(debug=False, port=8050)
+    if not dd.VIEW_ONLY:
+        print("Loading road network for truck routes ...")
+        from road_routes import get_router
+        get_router()
+    port = int(os.environ.get("PORT", 8050))
+    print(f"Starting Dash at http://localhost:{port}")
+    app.run(debug=False, host=os.environ.get("HOST", "127.0.0.1"), port=port)

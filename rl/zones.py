@@ -116,6 +116,9 @@ def _gap_to_zones(T_off: np.ndarray, labels: np.ndarray, k: int) -> np.ndarray:
     G = np.empty((len(T_off), k))
     for z in range(k):
         G[:, z] = T_off[:, labels == z].min(1)
+    # A zone's only member has no other member to be near (inf above): no penalty.
+    # Only seen with many zones (round 12, k=40); smaller k never hit it.
+    G[np.isinf(G)] = 0.0
     return G
 
 

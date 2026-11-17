@@ -4,3 +4,6 @@ data/
 .env
 models/
 runs/
+
+# Hugging Face Space build (python -m deploy.build_space); pushed to its own repo
+deploy/hf_space/

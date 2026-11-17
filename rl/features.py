@@ -10,7 +10,11 @@ Observation (float32): per zone [fill, share empty, share full, 60-min net chang
 (round 4, forecast=True) per zone forecast [rentals, returns] in the next 60 and
 180 min per dock (rl/forecast.py), time of day (sin, cos), day of week one-hot,
 the asked truck (zone one-hot, load), then every other truck (zone one-hot, busy,
-minutes left).
+minutes left, destination-zone one-hot, load). Round 15: when two trucks go idle
+in the same minute, the second one asked sees the first one's just-decided order
+(not yet applied to the env) in this same block — busy=1, minutes-left=1, its
+destination = the order's drop-off zone, its load = the order's quantity — instead
+of the stale pre-decision state (`FeatureBuilder.obs`'s `pending` argument).
 Round 9 adds optional feature groups, appended in FEATURE_GROUPS order, per zone:
   risk      share of stations expected to be empty / full in 1 h and 2 h (bikes now +
             the station's average hourly net flow in the training period), and the
@@ -104,23 +108,43 @@ def encode_action(src_zone: int, dst_zone: int, qty: int, n_zones: int) -> int:
     return 1 + pair * len(QTY_LEVELS) + QTY_LEVELS.index(qty)
 
 
-def obs_size(n_zones: int, n_trucks: int, forecast: bool = True, features=()) -> int:
+def obs_size(n_zones: int, n_trucks: int, forecast: bool = True, features=(),
+             others: bool = True) -> int:
+    """`others=False` (round 12 territories): no block for the other trucks. Each other
+    truck contributes 2*n_zones+3 (round 15: location + destination one-hots, busy,
+    minutes-left, load; was n_zones+2 before the destination+load were added)."""
     n_fc = len(fc.TARGETS) * n_zones if forecast else 0
     n_extra = n_zones * sum(GROUP_SIZE[g] for g in parse_features(features))
-    return (4 * n_zones + n_fc + 2 + 7 + (n_zones + 1) + (n_trucks - 1) * (n_zones + 2)
-            + n_extra)
+    n_others = (n_trucks - 1) * (2 * n_zones + 3) if others else 0
+    return 4 * n_zones + n_fc + 2 + 7 + (n_zones + 1) + n_others + n_extra
 
 
 class FeatureBuilder:
     """Holds the zone history for one env episode; builds obs and decodes actions."""
 
-    def __init__(self, env: BikeShareEnv, zones: Zones, forecast: bool = True, features=()):
+    def __init__(self, env: BikeShareEnv, zones: Zones, forecast: bool = True, features=(),
+                 action_zone_ids=None, others: bool = True, forecast_zones: Zones | None = None):
+        """Round 12 (territories): `zones` can be a truck's view of a finer zone set
+        (rl.territory.territory_view: its zones + one "outside" zone). Then
+        `action_zone_ids` limits orders to the territory, `others=False` drops the
+        other trucks from the obs, and `forecast_zones` (the finer set) supplies the
+        forecast, summed into the view's zones."""
         self.env = env
         self.z = zones
         self.forecast = forecast
         self.features = parse_features(features)
+        self.others = others
         # Demand forecast table (slot, zone, target), looked up by absolute time.
-        self.fc_table = fc.load_table(zones.zone_of_station, env.station_ids) if forecast else None
+        self.fc_table = None
+        if forecast and forecast_zones is None:
+            self.fc_table = fc.load_table(zones.zone_of_station, env.station_ids)
+        elif forecast:
+            base = fc.load_table(forecast_zones.zone_of_station, env.station_ids)
+            to_view = np.array([zones.zone_of_station[idx[0]]
+                                for idx in forecast_zones.stations_in_zone])
+            self.fc_table = np.zeros(base.shape[:1] + (zones.n_zones,) + base.shape[2:],
+                                     base.dtype)
+            np.add.at(self.fc_table, (slice(None), to_view), base)
         self.fc_slot0 = fc.slot_index(env.start_date, 0) * fc.SLOT_MIN   # env minute 0, absolute
         Z = zones.n_zones
         self.zone_cap = np.bincount(zones.zone_of_station, weights=env.capacity, minlength=Z)
@@ -128,7 +152,8 @@ class FeatureBuilder:
         # Truck-usable stations per zone (no ferry-only stations); action zone index ->
         # zone id (all zones under k-means; every zone but the island in round 5).
         self.truck_stations = [s[~env.truck_blocked[s]] for s in zones.stations_in_zone]
-        self.action_zones = np.array([z for z in range(Z) if len(self.truck_stations[z])])
+        self.action_zones = np.array([z for z in range(Z) if len(self.truck_stations[z])]
+                                     if action_zone_ids is None else action_zone_ids, dtype=np.int64)
         self.history = deque(maxlen=HISTORY_MIN + 1)
         if "risk" in self.features:
             self.flow = _profiles_bikes(env.station_ids, env.capacity)
@@ -176,7 +201,12 @@ class FeatureBuilder:
         return np.bincount(self.z.zone_of_station, weights=self.env.bikes,
                            minlength=self.z.n_zones)
 
-    def obs(self, truck_k: int) -> np.ndarray:
+    def obs(self, truck_k: int, pending=None) -> np.ndarray:
+        """`pending` (round 15, optional): the wrapper's (K, 3) array of orders already
+        decided this minute by other trucks but not yet applied to the env (all zeros
+        for a truck not yet decided, or decided to wait, or not idle this minute). For
+        any other truck with a non-zero row, its slot in the block below shows that
+        live decision instead of the env's stale pre-decision state."""
         env, Z, zof = self.env, self.z.n_zones, self.z.zone_of_station
         bikes = self._zone_bikes()
         fill = bikes / np.maximum(self.zone_cap, 1)
@@ -198,10 +228,18 @@ class FeatureBuilder:
         me = env.trucks[truck_k]
         parts += [np.eye(Z)[zof[me.location]], [me.load / env.truck_capacity]]
         for j, tk in enumerate(env.trucks):
-            if j == truck_k:
+            if j == truck_k or not self.others:
                 continue
-            left = min(1.0, max(0, tk.busy_until - env.t) / 60.0)
-            parts += [np.eye(Z)[zof[tk.location]], [float(tk.busy(env.t)), left]]
+            if pending is not None and pending[j].any():   # decided this minute, not applied yet
+                row = pending[j]
+                dest = zof[row[1]]
+                busy_flag, left, load_frac = 1.0, 1.0, row[2] / env.truck_capacity
+            else:
+                left = min(1.0, max(0, tk.busy_until - env.t) / 60.0)
+                dest = zof[tk.ops[-1][1]] if tk.ops else zof[tk.location]
+                busy_flag, load_frac = float(tk.busy(env.t)), tk.load / env.truck_capacity
+            parts += [np.eye(Z)[zof[tk.location]], [busy_flag, left],
+                     np.eye(Z)[dest], [load_frac]]
         if "risk" in self.features:
             parts += self._risk(t)
         if "travel" in self.features:
@@ -262,3 +300,20 @@ class FeatureBuilder:
         else:                                     # lowest fill ratio (single stop)
             dropoff = int(cand[np.argmin(env.bikes[cand] / env.capacity[cand])])
         return np.array([pickup + 1, dropoff, q], dtype=np.int64)
+
+    def action_mask(self) -> np.ndarray:
+        """(n_actions,) bool, round 11 (Maskable PPO): orders the zones can fill in full.
+        Wait is always allowed; a move of q bikes is allowed only if the pickup zone
+        has >= q bikes and the drop-off zone >= q free docks, counting at most
+        MAX_BIKES_PER_STOP per station (the multi-stop rule). Every action `decode`
+        turns into a wait (no bikes / no free dock) is masked too."""
+        env = self.env
+        Z = len(self.action_zones)
+        st = [self.truck_stations[z] for z in self.action_zones]
+        pick = np.array([np.minimum(env.bikes[s], MAX_BIKES_PER_STOP).sum() for s in st])
+        drop = np.array([np.minimum(env.capacity[s] - env.bikes[s], MAX_BIKES_PER_STOP).sum()
+                         for s in st])
+        q = np.asarray(QTY_LEVELS)
+        ok = (pick[:, None, None] >= q) & (drop[None, :, None] >= q)      # (src, dst, qty)
+        ok = ok[~np.eye(Z, dtype=bool)].reshape(-1)   # row-major (src, dst != src, qty)
+        return np.concatenate([[True], ok])

@@ -3,7 +3,9 @@
 - One decision per idle truck per simulated minute; busy trucks are never asked.
   Several idle trucks in the same minute are asked one at a time, then the minute
   is simulated with all their orders. While every truck is busy the wrapper just
-  advances time.
+  advances time. Round 15: a truck asked after another one already decided this
+  same minute sees that order in its own observation (rl/features.py's `pending`),
+  even though it isn't applied to the env until every idle truck has answered.
 - Action: Discrete zone-to-zone moves (see rl/features.py). Obs: compact Box.
 - Training reward = (env reward - no-truck reward over the same minutes, with the
   fleet's unavoidable daily fixed + shift cost added back) / reward_scale.
@@ -90,9 +92,13 @@ class RebalanceEnv(gym.Env):
                  init_occupancy: float = DEFAULT_INIT_OCCUPANCY,
                  reward_scale: float = 10.0, zone_scheme: str | None = None,
                  record_minutes: bool = False, multi_stop: bool = True,
-                 forecast: bool = True, features=None, stop_rule=None):
+                 forecast: bool = True, features=None, stop_rule=None, territories=None):
         """`windows`: fixed list of (start, end) episodes, used in order (eval/test).
-        Otherwise each episode is a random `episode_days` window in `sample_range`."""
+        Otherwise each episode is a random `episode_days` window in `sample_range`.
+        `territories` (round 12): one array of zone ids per truck. Truck k then only
+        orders moves between its territory's zones and sees rl.territory's view of
+        them (its zones + one outside zone, no other trucks), so a model trained on a
+        territory with 1 truck runs unchanged next to the other territory's truck."""
         super().__init__()
         if number_trucks < 1:
             raise ValueError("RebalanceEnv needs at least one truck")
@@ -110,6 +116,20 @@ class RebalanceEnv(gym.Env):
         self.zone_scheme = zone_scheme or zz.ZONE_SCHEME
         self.zones = zz.load_zones(self.zone_scheme)
         self._next_window = 0
+        self.territories = None
+        if territories is not None:
+            self.territories = [np.asarray(t, dtype=np.int64) for t in territories]
+            if len(self.territories) != self.K or len({len(t) for t in self.territories}) != 1:
+                raise ValueError("need one territory per truck, all the same size")
+            from rl.territory import territory_view
+            self.views = [territory_view(self.zones, t) for t in self.territories]
+            n = len(self.territories[0])
+            self.action_space = spaces.Discrete(n_actions(n))
+            self.observation_space = spaces.Box(
+                -1.0, 1.0, (obs_size(n + 1, 1, forecast, self.features, others=False),),
+                np.float32)
+            self.env = None
+            return
 
         # Actions cover the zones trucks can reach (not the island); obs covers all.
         n_truck_zones = len(truck_zones(self.zones, static_data()["ids"]))
@@ -141,14 +161,39 @@ class RebalanceEnv(gym.Env):
         self.env.reset(seed=0)
         self.base = no_truck_rewards(self.window, self.init_occupancy, trips)
         self.fleet_daily = self.K * (self.env.truck_fixed_cost + self.env.shift_cost)
-        self.fb = FeatureBuilder(self.env, self.zones, forecast=self.forecast,
-                                 features=self.features)
-        self.fb.reset()
+        if self.territories is None:
+            self.fbs = [FeatureBuilder(self.env, self.zones, forecast=self.forecast,
+                                       features=self.features)]
+        else:
+            n = len(self.territories[0])
+            self.fbs = [FeatureBuilder(self.env, v, forecast=self.forecast,
+                                       features=self.features, action_zone_ids=np.arange(n),
+                                       others=False, forecast_zones=self.zones)
+                        for v in self.views]
+        for fb in self.fbs:
+            fb.reset()
         self.true_total = 0.0
         self.minute_rewards: list[float] = []
         self.queue: list[int] = []
         self._advance()            # trucks start idle, so this asks right away
-        return self.fb.obs(self.queue[0]), self._info()
+        return self._obs(self.queue[0]), self._info()
+
+    @property
+    def fb(self) -> FeatureBuilder:
+        """The feature builder of the truck being asked (the only one without territories)."""
+        return self._fb(self.queue[0] if self.queue else 0)
+
+    def _fb(self, k: int) -> FeatureBuilder:
+        return self.fbs[k if self.territories is not None else 0]
+
+    def _obs(self, k: int) -> np.ndarray:
+        """Round 15: `self.pending` carries any order already decided this minute by
+        another idle truck but not yet applied to the env (see `step`), so a truck
+        asked after it sees that live decision, not the other truck's stale pre-decision
+        state. `self.pending` is zero rows for any truck not yet decided / busy / not
+        part of this minute's idle set, so this has no effect for K=1 or outside a
+        same-minute multi-truck decision."""
+        return self._fb(k).obs(k, pending=self.pending)
 
     # ── stepping ─────────────────────────────────────────────────────────────
     def _sim_minute(self, action: np.ndarray) -> float:
@@ -157,7 +202,8 @@ class RebalanceEnv(gym.Env):
         self.true_total += r
         if self.record_minutes:
             self.minute_rewards.append(r)
-        self.fb.record()
+        for fb in self.fbs:
+            fb.record()
         shaped = r - self.base[m]
         if m % MINUTES_PER_DAY == 0:
             shaped += self.fleet_daily     # unavoidable: same for every policy
@@ -179,15 +225,20 @@ class RebalanceEnv(gym.Env):
 
     def step(self, action):
         k = self.queue.pop(0)
-        self.pending[k] = self.fb.decode(action)
-        self.fb.note(k, self.pending[k])
+        fb = self._fb(k)
+        self.pending[k] = fb.decode(action)
+        fb.note(k, self.pending[k])
         if self.queue:                         # another idle truck, same minute
-            return self.fb.obs(self.queue[0]), 0.0, False, False, self._info()
+            return self._obs(self.queue[0]), 0.0, False, False, self._info()
         reward = self._sim_minute(self.pending)
         reward += self._advance()
         done = not self.queue
-        obs = self.fb.obs(self.queue[0] if self.queue else 0)
+        obs = self._obs(self.queue[0] if self.queue else 0)
         return obs, float(reward), done, False, self._info()
+
+    def action_masks(self) -> np.ndarray:
+        """Valid actions now (sb3_contrib MaskablePPO calls this; round 11)."""
+        return self.fb.action_mask()
 
     def _info(self) -> dict:
         return {"minute": self.env.t, "window": self.window,

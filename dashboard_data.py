@@ -14,6 +14,11 @@ trip log, the same for every policy). A replay is rebuilt automatically when its
 fingerprint (format, start occupancy, period, model file size and time) changes,
 e.g. after a model is retrained. Changes to the env itself are not detected: run
 with --rebuild after editing bikeshare_env.
+
+View-only mode (DASHBOARD_VIEW_ONLY=1, used by the Hugging Face Space built with
+deploy/build_space.py): the saved replays are served as they are, never rebuilt, and
+nothing from rl/ (PyTorch, the models) or the road network is loaded. The policy list
+comes from data/replay/manifest.json, truck routes from data/replay/_routes.json.
 """
 import argparse
 import json
@@ -26,10 +31,12 @@ import pandas as pd
 from bikeshare_env.env import DEFAULT_INIT_OCCUPANCY, MINUTES_PER_DAY
 from bikeshare_env.policies import POLICIES
 
-try:   # registers the trained RL models as policies
-    import rl.policy  # noqa: F401
-except ImportError as e:
-    print(f"RL policies not loaded: {e}")
+VIEW_ONLY = os.environ.get("DASHBOARD_VIEW_ONLY") == "1"
+if not VIEW_ONLY:
+    try:   # registers the trained RL models as policies
+        import rl.policy  # noqa: F401
+    except ImportError as e:
+        print(f"RL policies not loaded: {e}")
 
 REPLAY_START = "2026-08-01"
 REPLAY_END = "2026-09-30"
@@ -38,6 +45,16 @@ FORMAT_VERSION = 1
 _PER_MINUTE = ("reward", "fulfilled", "lost", "active", "blocked", "pending")
 _CUMULATIVE = ("reward", "fulfilled", "lost", "blocked")      # shown as running totals
 _TRUCK = ("truck_status", "truck_load", "truck_station", "truck_moved")
+MANIFEST = os.path.join(REPLAY_DIR, "manifest.json")     # view-only: key -> label
+ROUTES = os.path.join(REPLAY_DIR, "_routes.json")        # view-only: "frm,to" -> lat, lon
+
+
+def policies() -> dict[str, str]:
+    """The dashboard's policies, key -> label, in dropdown order."""
+    if VIEW_ONLY:
+        with open(MANIFEST, encoding="utf-8") as f:
+            return json.load(f)["policies"]
+    return {key: cls.label for key, cls in POLICIES.items()}
 
 
 def n_days() -> int:
@@ -76,6 +93,8 @@ def _stored_fingerprint(policy_key: str) -> dict | None:
 
 
 def is_current(policy_key: str) -> bool:
+    if VIEW_ONLY:                 # served as saved; there is nothing to rebuild it with
+        return os.path.exists(_path(policy_key))
     return _stored_fingerprint(policy_key) == fingerprint(policy_key)
 
 
@@ -123,7 +142,7 @@ def load_trips() -> dict:
 @lru_cache(maxsize=3)
 def load(policy_key: str) -> dict:
     """A policy's replay, built first if missing or out of date (a few minutes for RL)."""
-    if not is_current(policy_key):
+    if not VIEW_ONLY and not is_current(policy_key):
         build(policy_key)
     with np.load(_path(policy_key)) as z:
         rep = {k: z[k] for k in z.files if k not in ("fingerprint", "totals")}
@@ -183,15 +202,19 @@ def _trucks(rep, a, b, range_start, with_routes) -> dict | None:
     if K == 0:
         return None
     legs = []
-    router = None
+    route = None
     if with_routes:
-        from road_routes import get_router
-        router = get_router()
+        if VIEW_ONLY:
+            stored = stored_routes()
+            route = lambda f, t: stored.get(f"{f},{t}", ([], []))   # noqa: E731
+        else:
+            from road_routes import get_router
+            route = get_router().route
     for k, frm, to, depart, arrive, load in rep["truck_legs"].tolist():
         if depart >= b or arrive <= a:
             continue
-        if router is not None:
-            lat, lon = router.route(frm, to)
+        if route is not None:
+            lat, lon = route(frm, to)
             lat, lon = list(lat), list(lon)
         else:
             lat = lon = []
@@ -205,6 +228,25 @@ def _trucks(rep, a, b, range_start, with_routes) -> dict | None:
             "load": rep["truck_load"][rows].T.tolist(),
             "station": rep["truck_station"][rows].T.tolist(),
             "moved": (moved[rows] - base).tolist()}
+
+
+@lru_cache(maxsize=1)
+def stored_routes() -> dict:
+    with open(ROUTES, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def leg_routes(policy_keys) -> dict:
+    """"frm,to" -> (lats, lons) for every truck leg in these replays (for view-only)."""
+    from road_routes import get_router
+    router, out = get_router(), {}
+    for key in policy_keys:
+        with np.load(_path(key)) as z:
+            legs = z["truck_legs"]
+        for frm, to in {(int(f), int(t)) for f, t in legs[:, 1:3].tolist()} if len(legs) else ():
+            if f"{frm},{to}" not in out:
+                out[f"{frm},{to}"] = [list(v) for v in router.route(frm, to)]
+    return out
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

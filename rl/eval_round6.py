@@ -62,6 +62,11 @@ def run(trucks: int, scheme: str, choose, features=None, stop_rule=None, window=
 
 
 def validation(folder: str, k: int) -> tuple[int, float]:
+    """(steps, $/week) of the kept checkpoint. Runs trained with round 14's aged-starts
+    validation report their S1 score; earlier runs their fresh-weeks score."""
+    from rl.validation import picked
+    if picked(folder) is not None:
+        return picked(folder)
     d = np.load(os.path.join(folder, "evaluations.npz"))
     val = d["results"].mean(1) * 10 - 7 * k * 260       # $ vs no trucks per week
     i = int(val.argmax())
