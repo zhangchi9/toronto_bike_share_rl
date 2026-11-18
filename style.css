@@ -7,8 +7,10 @@ body { margin: 0; font-family: sans-serif; background: #f4f4f4; color: #1a1a2e; 
   padding: 10px 16px; background: #1a1a2e; color: #ccc; position: relative; z-index: 2000;
 }
 #header .title-block { flex: 1 0 100%; text-align: center; }
-#header .brand { margin: 0; font-weight: bold; font-size: 22px; color: #fff; }
-#header .authors { margin-top: 2px; font-size: 13px; color: #b8b8d0; }
+#header .brand { margin: 0; font-weight: bold; font-size: 22px; color: #fff;
+                 text-wrap: balance; }
+#header .subtitle { margin-top: 3px; font-size: 14px; color: #dcdcec; text-wrap: balance; }
+#header .authors { margin-top: 3px; font-size: 13px; color: #b8b8d0; }
 #header .hl { display: flex; align-items: center; gap: 6px; }
 #header input[type=date], #header select {
   font: inherit; font-size: 14px; padding: 4px 6px; border: 1px solid #ccc;
@@ -76,6 +78,8 @@ body { margin: 0; font-family: sans-serif; background: #f4f4f4; color: #1a1a2e; 
 
 @media (max-width: 600px) {
   #header { padding: 8px 16px; }
+  #header .brand { font-size: 18px; }
+  #header .subtitle { font-size: 12px; }
   #controls, #metrics { padding-left: 16px; padding-right: 16px; }
   .legend { font-size: 11px; padding: 6px 8px; }
   #map { height: 55vh; }
