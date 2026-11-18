@@ -6,7 +6,9 @@ body { margin: 0; font-family: sans-serif; background: #f4f4f4; color: #1a1a2e; 
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px;
   padding: 10px 16px; background: #1a1a2e; color: #ccc; position: relative; z-index: 2000;
 }
-#header .brand { font-weight: bold; font-size: 18px; color: #fff; margin-right: 8px; }
+#header .title-block { flex: 1 0 100%; text-align: center; }
+#header .brand { margin: 0; font-weight: bold; font-size: 22px; color: #fff; }
+#header .authors { margin-top: 2px; font-size: 13px; color: #b8b8d0; }
 #header .hl { display: flex; align-items: center; gap: 6px; }
 #header input[type=date], #header select {
   font: inherit; font-size: 14px; padding: 4px 6px; border: 1px solid #ccc;

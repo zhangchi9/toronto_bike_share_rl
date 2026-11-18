@@ -43,6 +43,45 @@ async function fetchBin(url) {      // see deploy/build_static.py for the layout
     return out;
 }
 
+// ── Rides as arrows ────────────────────────────────────────────────────────────
+// A line from the start station to an arrowhead whose tip stops at the edge of the
+// destination station's dot. Head sizes are screen pixels at map zoom `zoom` (MapLibre
+// tiles are 512 px), so the arrows are redrawn after a zoom. `pairs` is s0, e0, s1, e1...
+var HEAD_LEN = 8, HEAD_HALF = 4;
+function rideArrows(pairs, st, size, zoom) {
+    var k = 512 * Math.pow(2, zoom) / 360;               // px per degree of longitude
+    var out = {lat: [], lon: [], hLat: [], hLon: []};
+    for (var i = 0; i < pairs.length; i += 2) {
+        var s = pairs[i], e = pairs[i + 1], cos = Math.cos(st.lat[e] * Math.PI / 180);
+        var dx = (st.lon[e] - st.lon[s]) * k, dy = (st.lat[e] - st.lat[s]) * k / cos;
+        var len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 1) continue;                            // back to its own station
+        var ux = dx / len, uy = dy / len;
+        var gap = Math.min(size[e] / 2 + 1, len / 3);    // stop at the dot's edge
+        var head = Math.min(HEAD_LEN, 0.6 * (len - gap)), half = head * HEAD_HALF / HEAD_LEN;
+        var bx = -ux * (gap + head), by = -uy * (gap + head);
+        var at = function (px, py) {                      // px from the destination → lat/lon
+            return [st.lat[e] + py * cos / k, st.lon[e] + px / k];
+        };
+        var tip = at(-ux * gap, -uy * gap), base = at(bx, by);
+        var w1 = at(bx - uy * half, by + ux * half), w2 = at(bx + uy * half, by - ux * half);
+        out.lat.push(st.lat[s], base[0], null); out.lon.push(st.lon[s], base[1], null);
+        out.hLat.push(w1[0], tip[0], w2[0], w1[0], null);
+        out.hLon.push(w1[1], tip[1], w2[1], w1[1], null);
+    }
+    return out;
+}
+
+function arrowTraces(a, rgb) {      // the lines, then the filled heads
+    return [
+        {type: 'scattermap', mode: 'lines', lat: a.lat, lon: a.lon, hoverinfo: 'skip',
+         line: {color: 'rgba(' + rgb + ',0.5)', width: 1}},
+        {type: 'scattermap', mode: 'lines', fill: 'toself', lat: a.hLat, lon: a.hLon,
+         hoverinfo: 'skip', fillcolor: 'rgba(' + rgb + ',0.8)',
+         line: {color: 'rgba(' + rgb + ',0.8)', width: 0}}
+    ];
+}
+
 // ── State ──────────────────────────────────────────────────────────────────────
 var S = {
     meta: null, stations: null, zones: [], routes: null, routesP: null,
@@ -260,12 +299,10 @@ function render() {
     }
 
     // Rides in progress (only requests the simulation actually served).
-    var mLat = [], mLon = [], cLat = [], cLon = [];
+    var member = [], casual = [];                     // start, end station of each ride
     for (var j = 0; j < tr.sm.length; j++) {
         if (!pol.trip_ok[j] || tr.sm[j] > t || tr.em[j] <= t) continue;
-        var s = tr.s[j], e = tr.e[j];
-        if (tr.casual[j]) { cLat.push(st.lat[s], st.lat[e], null); cLon.push(st.lon[s], st.lon[e], null); }
-        else              { mLat.push(st.lat[s], st.lat[e], null); mLon.push(st.lon[s], st.lon[e], null); }
+        (tr.casual[j] ? casual : member).push(tr.s[j], tr.e[j]);
     }
 
     // Trucks: position along the road route of the trip in progress.
@@ -353,12 +390,12 @@ function render() {
             zoom: sub.map.getZoom(), bearing: sub.map.getBearing(), pitch: sub.map.getPitch()});
     }
     if (drawing) { redraw = true; return; }           // draw again when this frame is done
+    S.arrowZoom = layout.map.zoom;
     var z = zoneTraces();
-    var data = z[0].concat([
-        {type: 'scattermap', mode: 'lines', lat: mLat, lon: mLon,
-         line: {color: 'rgba(51,153,255,0.5)', width: 1}, hoverinfo: 'skip'},
-        {type: 'scattermap', mode: 'lines', lat: cLat, lon: cLon,
-         line: {color: 'rgba(255,136,51,0.5)', width: 1}, hoverinfo: 'skip'},
+    var data = z[0]
+        .concat(arrowTraces(rideArrows(member, st, size, S.arrowZoom), '51,153,255'))
+        .concat(arrowTraces(rideArrows(casual, st, size, S.arrowZoom), '255,136,51'))
+        .concat([
         {type: 'scattermap', mode: 'markers', lat: st.lat, lon: st.lon,
          marker: {color: color, size: size, cmin: 0, cmax: 1, opacity: 0.9,
                   colorscale: [[0, '#e8000b'], [0.15, '#ff9900'], [0.5, '#2ca02c'], [1, '#1f4fd1']]},
@@ -369,6 +406,13 @@ function render() {
                                                     responsive: true}))
         .finally(function () {
             drawing = false;
+            var fl = gd._fullLayout, m = fl && fl.map && fl.map._subplot && fl.map._subplot.map;
+            if (m && !m._bsArrows) {                  // arrowheads keep their pixel size
+                m._bsArrows = true;
+                m.on('zoomend', function () {
+                    if (Math.abs(m.getZoom() - S.arrowZoom) > 0.01) render();
+                });
+            }
             if (redraw) { redraw = false; render(); }
         });
 }

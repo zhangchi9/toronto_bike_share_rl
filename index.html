@@ -5,12 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bike Share Toronto</title>
 <meta name="description" content="Minute-by-minute replays of Bike Share Toronto, Aug 1 - Sep 30, 2026, under five truck rebalancing solutions.">
-<link rel="stylesheet" href="style.css?v=2988576-dirty">
-<script src="plotly.min.js?v=2988576-dirty"></script>
+<link rel="stylesheet" href="style.css?v=e0b95650a7">
+<script src="plotly.min.js?v=dc48d61740"></script>
 </head>
 <body>
 <header id="header">
-  <span class="brand">Bike Share Toronto</span>
+  <div class="title-block">
+    <h1 class="brand">Bike Share Toronto</h1>
+    <div class="authors">Chi Zhang · Brett Zeleznik · Tahera Yesmin</div>
+  </div>
   <label class="hl">Dates:
     <input type="date" id="date-start" value="2026-08-01">
     <span class="dash">→</span>
@@ -35,8 +38,9 @@
     <div class="lg-title">Station fill (bikes / docks)</div>
     <div><span style="color:#e8000b">● empty</span> <span style="color:#2ca02c">● half</span> <span style="color:#1f4fd1">● full</span></div>
     <hr>
-    <div><span style="color:#3399ff">— Member</span></div>
-    <div><span style="color:#ff8833">— Casual</span></div>
+    <div><span style="color:#3399ff">➤ Member ride</span></div>
+    <div><span style="color:#ff8833">➤ Casual ride</span></div>
+    <div style="color:#555">arrow: start → destination</div>
     <hr>
     <div class="lg-title">Trucks (icon colour = status)</div>
     <div><span style="color:#6a1b9a">● with bikes</span> <span style="color:#757575">● empty</span></div>
@@ -73,6 +77,6 @@
   <p class="note" id="footer"></p>
 </section>
 
-<script src="app.js?v=2988576-dirty"></script>
+<script src="app.js?v=1d4cac38d8"></script>
 </body>
 </html>
