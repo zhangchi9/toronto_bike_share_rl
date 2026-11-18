@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bike Share Toronto</title>
+<meta name="description" content="Minute-by-minute replays of Bike Share Toronto, Aug 1 - Sep 30, 2026, under five truck rebalancing solutions.">
+<link rel="stylesheet" href="style.css">
+<script src="plotly.min.js"></script>
+</head>
+<body>
+<header id="header">
+  <div class="title-block">
+    <h1 class="brand">Rebalancing Bike Share Toronto with Deep Reinforcement Learning</h1>
+    <div class="subtitle">Minute-by-minute replay of truck rebalancing solutions, Aug–Sep 2026</div>
+    <div class="authors">Chi Zhang · Brett Zeleznik · Tahera Yesmin</div>
+  </div>
+  <label class="hl">Dates:
+    <input type="date" id="date-start" value="2026-08-01">
+    <span class="dash">→</span>
+    <input type="date" id="date-end" value="2026-08-07">
+  </label>
+  <label class="hl">Solution:
+    <select id="policy-select"></select>
+  </label>
+  <span id="total-trips"></span>
+  <label class="zone-toggle"><input type="checkbox" id="zone-toggle" checked> Show zones</label>
+  <span id="time-display"></span>
+  <label class="hl" id="day-select-wrap" hidden>Jump to day:
+    <select id="day-select"></select>
+  </label>
+</header>
+
+<div id="map-wrap">
+  <div id="map"></div>
+  <div id="loading">Loading…</div>
+  <details class="legend" id="legend" open>
+    <summary>Legend</summary>
+    <div class="lg-title">Station fill (bikes / docks)</div>
+    <div><span style="color:#e8000b">● empty</span> <span style="color:#2ca02c">● half</span> <span style="color:#1f4fd1">● full</span></div>
+    <hr>
+    <div><span style="color:#3399ff">➤ Member ride</span></div>
+    <div><span style="color:#ff8833">➤ Casual ride</span></div>
+    <div style="color:#555">arrow: start → destination</div>
+    <hr>
+    <div class="lg-title">Trucks (icon colour = status)</div>
+    <div><span style="color:#6a1b9a">● with bikes</span> <span style="color:#757575">● empty</span></div>
+    <div><span style="color:#ef6c00">● loading/unloading</span> <span style="color:#212121">● idle</span></div>
+    <div style="color:#555">━ route ahead (colour per truck), faint = driven</div>
+  </details>
+</div>
+
+<section id="metrics"></section>
+
+<section id="controls">
+  <div class="row">
+    <button id="play-btn" type="button">▶ Play</button>
+    <label>Speed:
+      <select id="speed-select">
+        <option value="1">1×  (very slow)</option>
+        <option value="5">5×  (slow)</option>
+        <option value="10" selected>10× (default)</option>
+        <option value="30">30× (fast)</option>
+        <option value="60">60× (very fast)</option>
+      </select>
+    </label>
+  </div>
+  <div id="slider-scroll">
+    <div id="slider-inner">
+      <div id="slider-tip" hidden></div>
+      <input type="range" id="time-slider" min="0" max="1439" step="1" value="0" aria-label="Time">
+      <div id="slider-marks"></div>
+    </div>
+  </div>
+  <p class="note">Replay of one continuous simulated run from Aug 1, 2026: stations are filled
+    once at 00:00 on Aug 1 and bikes carry over between days. Running totals count from the
+    start of the picked range.</p>
+  <p class="note" id="footer"></p>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

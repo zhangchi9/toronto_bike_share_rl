@@ -225,12 +225,46 @@ function(current_min, show_zones, sim, station_data, layout, zones) {
     }
 
     var tr=sim.trips, n=tr.sm.length;
-    var mLat=[], mLon=[], cLat=[], cLon=[];
+    var member=[], casual=[];               // start, end station of each ride in progress
     for (var i=0; i<n; i++) {
         if (!tr.ok[i] || tr.sm[i] > t || tr.em[i] <= t) continue;
-        var s=tr.s[i], e=tr.e[i];
-        if (tr.casual[i]) {cLat.push(stLat[s],stLat[e],null); cLon.push(stLon[s],stLon[e],null);}
-        else              {mLat.push(stLat[s],stLat[e],null); mLon.push(stLon[s],stLon[e],null);}
+        (tr.casual[i] ? casual : member).push(tr.s[i], tr.e[i]);
+    }
+
+    // Rides as arrows: a line from the start station to an arrowhead whose tip stops at
+    // the edge of the destination station's dot. Head sizes are screen pixels at map
+    // zoom `zoom` (MapLibre tiles are 512 px), so the arrows are redrawn after a zoom.
+    function rideArrows(pairs, zoom) {
+        var kp=512*Math.pow(2, zoom)/360, out={lat:[], lon:[], hLat:[], hLon:[]};
+        for (var q=0; q<pairs.length; q+=2) {
+            var s=pairs[q], e=pairs[q+1], cs=Math.cos(stLat[e]*Math.PI/180);
+            var dx=(stLon[e]-stLon[s])*kp, dy=(stLat[e]-stLat[s])*kp/cs;
+            var len=Math.sqrt(dx*dx+dy*dy);
+            if (len<1) continue;                              // back to its own station
+            var ux=dx/len, uy=dy/len;
+            var gap=Math.min(size[e]/2+1, len/3);             // stop at the dot's edge
+            var head=Math.min(8, 0.6*(len-gap)), half=head/2;
+            var bx=-ux*(gap+head), by=-uy*(gap+head);
+            var at=function(px, py) { return [stLat[e]+py*cs/kp, stLon[e]+px/kp]; };
+            var tip=at(-ux*gap, -uy*gap), base=at(bx, by);
+            var w1=at(bx-uy*half, by+ux*half), w2=at(bx+uy*half, by-ux*half);
+            out.lat.push(stLat[s], base[0], null); out.lon.push(stLon[s], base[1], null);
+            out.hLat.push(w1[0], tip[0], w2[0], w1[0], null);
+            out.hLon.push(w1[1], tip[1], w2[1], w1[1], null);
+        }
+        return out;
+    }
+    function arrowTraces(zoom) {            // member lines, heads, casual lines, heads
+        var res=[];
+        [[member,'51,153,255'], [casual,'255,136,51']].forEach(function(g) {
+            var a=rideArrows(g[0], zoom);
+            res.push({type:'scattermap', mode:'lines', lat:a.lat, lon:a.lon, hoverinfo:'skip',
+                      line:{color:'rgba('+g[1]+',0.5)', width:1}});
+            res.push({type:'scattermap', mode:'lines', fill:'toself', lat:a.hLat, lon:a.hLon,
+                      hoverinfo:'skip', fillcolor:'rgba('+g[1]+',0.8)',
+                      line:{color:'rgba('+g[1]+',0.8)', width:0}});
+        });
+        return res;
     }
 
     var hh=String(Math.floor(t/60)).padStart(2,'0');
@@ -359,12 +393,24 @@ function(current_min, show_zones, sim, station_data, layout, zones) {
             textfont:{size:15, color:'#111111', family:'Noto Sans Bold'}});
     }
 
+    // After a zoom, redraw the arrows of the minute on screen (traces 0-3 after the zones).
+    var zoom=viewLayout.map.zoom;
+    window._bsArrows={zoom: zoom, first: zoneTraces.length, make: arrowTraces};
+    if (sub && sub.map && !sub.map._bsArrows) {
+        var mp=sub.map;
+        mp._bsArrows=true;
+        mp.on('zoomend', function() {
+            var A=window._bsArrows, g=document.querySelector('#map .js-plotly-plot');
+            if (!A || !g || Math.abs(mp.getZoom()-A.zoom)<0.01) return;
+            A.zoom=mp.getZoom();
+            var tr4=A.make(A.zoom), idx=[A.first, A.first+1, A.first+2, A.first+3];
+            Plotly.restyle(g, {lat: tr4.map(function(x){return x.lat;}),
+                               lon: tr4.map(function(x){return x.lon;})}, idx);
+        });
+    }
+
     var figure = {
-        data: zoneTraces.concat([
-            {type:'scattermap', mode:'lines', lat:mLat, lon:mLon,
-             line:{color:'rgba(51,153,255,0.5)', width:1}, hoverinfo:'skip'},
-            {type:'scattermap', mode:'lines', lat:cLat, lon:cLon,
-             line:{color:'rgba(255,136,51,0.5)', width:1}, hoverinfo:'skip'},
+        data: zoneTraces.concat(arrowTraces(zoom)).concat([
             {type:'scattermap', mode:'markers', lat:stLat, lon:stLon,
              marker:{color:color, size:size, cmin:0, cmax:1, opacity:0.9,
                      colorscale:[[0,'#e8000b'],[0.15,'#ff9900'],[0.5,'#2ca02c'],[1,'#1f4fd1']]},
@@ -506,10 +552,12 @@ def serve_layout():
                                       style={"color":"#1f4fd1","fontSize":"12px"}),
                         ]),
                         html.Hr(style={"margin":"4px 0","borderColor":"#ccc"}),
-                        html.Div(html.Span("— Member",
+                        html.Div(html.Span("➤ Member ride",
                                  style={"color":"#3399ff","fontSize":"12px"})),
-                        html.Div(html.Span("— Casual",
+                        html.Div(html.Span("➤ Casual ride",
                                  style={"color":"#ff8833","fontSize":"12px"})),
+                        html.Div(html.Span("arrow: start → destination",
+                                 style={"color":"#555","fontSize":"12px"})),
                         html.Hr(style={"margin":"4px 0","borderColor":"#ccc"}),
                         html.Div("Trucks (icon colour = status)",
                                  style={"fontWeight":"bold","fontSize":"12px"}),

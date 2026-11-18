@@ -1,5 +1,17 @@
 # Toronto Bike Share Rebalancing with Reinforcement Learning
 
+**Chi Zhang · Brett Zeleznik · Tahera Yesmin**
+
+**[▶ Live dashboard](https://zhangchi9.github.io/toronto_bike_share_rl/)**: replay every
+station and truck minute by minute, Aug 1 – Sep 30, 2026, under five solutions (no
+trucks, a fixed shuttle, the DQN, the DQN + lookahead planner, and two trucks on split
+territories). Station colour shows how full each station is, every ride in progress is
+an arrow from its start station to its destination, and running totals (reward, rides
+served and lost, bikes moved) update as it plays. It runs entirely in the browser, with
+no install.
+
+## The problem
+
 Toronto's bike share system runs ~1,070 docking stations. Commuting is
 one-directional, so stations drift out of balance within hours: downtown
 fills with returned bikes every morning and empties every evening (the
@@ -46,6 +58,8 @@ pays for its own extra truck yet — see "Open problems" below.
   Zones are balanced not just on dock count but on each station's
   historical *rebalancing need* — this change alone removed a training
   collapse that occasionally sank an otherwise-fine agent.
+
+  ![The champion's zone map: 20 mainland zones plus the Island zone](docs/figures/zones_champion.png)
 - **One decision per idle truck.** The agent is asked only when a truck
   goes idle; it chooses to wait, or to send the truck on a multi-stop
   mission to a zone, picking up or dropping off up to 5 bikes per station
@@ -68,6 +82,8 @@ pays for its own extra truck yet — see "Open problems" below.
   the most consistent across training seeds — the distributional and
   Rainbow-style variants, built for harder value-estimation problems, did
   measurably worse here.
+
+  ![Cumulative test gain vs. no trucks, all six algorithms, 3 seeds each](docs/figures/algo_comparison.png)
 - **A lookahead planner on top of the trained DQN** — the project's single
   biggest win, and it adds no new learned parameters. At each decision it
   takes the DQN's 8 best candidate moves, rolls each one forward 24
@@ -108,6 +124,7 @@ pays for its own extra truck yet — see "Open problems" below.
 | `results/` | Per-round test results, metrics and figures |
 | `docs/report.md` | The full write-up (also exported as `docs/report.docx` and `docs/report_slides.pptx`) |
 | `app.py` / `dashboard_data.py` | Interactive dashboard — replay any trained policy over any date range |
+| `deploy/` | Builds the dashboard for the web: a static site for GitHub Pages (the live link above) or a Hugging Face Space ([deploy/README.md](deploy/README.md)) |
 | `tests/` | The test suite |
 
 ## Running it
@@ -115,6 +132,7 @@ pays for its own extra truck yet — see "Open problems" below.
 ```bash
 pip install -r requirements.txt
 python app.py                                 # dashboard at http://localhost:8050
+python -m deploy.build_static                 # the static web copy, in deploy/static_site/
 python -m rl.train --algo dqn --trucks 1      # retrain the champion DQN
 python -m rl.eval_round13                     # test the lookahead planner
 pytest tests/                                 # run the test suite
