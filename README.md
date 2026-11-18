@@ -103,16 +103,23 @@ pays for its own extra truck yet — see "Open problems" below.
 
 ## Open problems
 
-- **A second truck still doesn't pay for itself.** The next step is
-  probably a different structure entirely — e.g. extending the lookahead
-  planner to score joint 2-truck candidates — rather than training another
-  learned policy from scratch.
-- **The planner is expensive to evaluate**, which slows down testing new
-  ideas against it. A cheaper approximation (fewer scenarios/candidates, or
-  a learned critic) is worth exploring.
-- **Validation methodology changed mid-project** (an "aged-starts" scheme
-  now predicts test results far better than the original scheme did), so
-  some earlier rounds' choices were made under a weaker signal.
+Two questions decide whether an operator could actually run this
+(details in [the report's Discussion](docs/report.md#33-discussion-and-next-steps)):
+
+- **More than one truck.** The champion's truck is busy 99% of the time, so
+  there is work for a second one, but both 2-truck policies lost money net of
+  its cost. The trucks share one stock of bikes, each is a moving target for
+  the other while they learn, and the shared reward doesn't say which truck
+  earned it. Next steps, cheapest first: let the lookahead planner coordinate
+  the trucks (no new training), start 2-truck training from the champion's
+  weights, give each truck its own credit (difference rewards or cooperative
+  multi-agent methods), and hire the second truck only for peak hours.
+- **A different season.** Training, validation and test are all May–September.
+  January–February has about a tenth of August's trips, mostly members, on
+  fewer stations, while a truck still costs $260 a day. January–April 2026 is
+  already in the trip log and unused, so the next test runs every policy
+  unchanged on a winter window (Jan–Feb) and a spring window (Mar–Apr), plus a
+  planner variant whose scenarios come from recent weeks instead of summer.
 
 ## Repo layout
 

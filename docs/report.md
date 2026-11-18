@@ -586,50 +586,146 @@ truck.
 
 ### 3.3 Discussion and Next Steps
 
-The project's gains came from three different kinds of improvement, roughly
-in order of how much engineering they took versus how much they paid off:
+One truck, driven by the DQN from 3.2.3 and the lookahead planner from 3.2.5,
+earns **+$333,282** over the no-truck baseline across the 51-day test and
+fulfills about 90.5% of ride requests, against 85.15% with no trucks. Two
+questions decide whether an operator could actually run this, and the results
+so far don't answer either: can the method drive a **fleet** rather than a
+single truck, and does it still pay **outside the summer** it was built in?
 
-1. **A better representation of the problem** (zones built from road time +
-   demand similarity, rebalanced on historical need rather than raw dock
-   count) turned an unreliable training signal into a consistent one —
-   worth doing before anything else, since a bad zone layout could sink an
-   otherwise-fine algorithm.
-2. **A better-informed, better-chosen learning algorithm** (DQN, with all
-   four engineered feature groups, over five alternatives including
-   distributional and Rainbow-style variants) roughly matched what simple
-   heuristics (fixed shuttle, $59,824) could never reach on their own.
-3. **Decision-time search on top of the trained model** (the lookahead
-   planner) added **another $76,079 for zero additional training** — the
-   single best dollar-per-engineering-hour result in the project — at the
-   cost of much more compute per decision at run time.
+#### 3.3.1 Training a policy for more than one truck
 
-**Where the project stands.** The current champion — one truck, the DQN from
-3.2.3, driven by the lookahead planner from 3.2.5 — earns **+$333,282**
-over the no-truck baseline across the 51-day test, fulfilling about 90.5% of
-ride requests versus 85.15% with no rebalancing at all.
+**There is work for a second truck.** The champion's truck is on a mission 99%
+of the time, and in roughly 2 of every 5 test minutes some zone it isn't in is
+in acute crisis. Demand isn't the limit; one truck's time is.
 
-**Open problems:**
+**Both attempts still lost money** (3.2.6). Two independent territory DQNs
+earned $236,685 and a coordinated whole-city DQN earned $72,040, both below the
+one-truck champion once the second truck's cost (about $53,000 over the test)
+is paid. Four things make two trucks harder to train than one, and each points
+to a fix:
 
-- **A second truck still doesn't pay for itself.** Both a hard territory
-  split and a fully coordinated joint policy lost money net of the extra
-  truck's cost, and the coordinated version — specifically designed to fix
-  the bugs diagnosed from the territory split's failure — did *worse*, not
-  better. The likely next step isn't more training of either approach as-is,
-  but a genuinely different structure: e.g., extending the lookahead
-  planner itself to score joint 2-truck candidate pairs against the same
-  truck-driven DQN, rather than training a second learned policy from
-  scratch.
-- **The planner is expensive to evaluate.** A full test run takes hours per
-  seed (K×S simulated rollouts per decision), which slows down testing any
-  further idea against the current champion. A cheaper approximation that
-  keeps most of the gain — fewer scenarios, fewer candidates, or a learned
-  critic that approximates the rollout score — is worth exploring before
-  the planner becomes a bottleneck on iteration speed.
-- **Validation itself changed mid-project.** The original two-fresh-week
-  validation scheme barely predicted test performance (Spearman 0.25–0.46
-  across different comparisons in this report) and was replaced by an
-  "aged starts" scheme that predicts it far better (Spearman 0.96). Earlier
-  rounds' checkpoint and design choices were made under the weaker scheme;
-  none have been found to be wrong as a result, but it's an open question
-  worth a pass if time allows.
+1. **The trucks share one stock of bikes.** About 31% of trips cross between
+   the two territories, so splitting the city can't work: each truck keeps
+   undoing the other's balancing across a boundary it can't see. A 2-truck
+   policy has to see the whole city.
+2. **Each truck is a moving target for the other.** While both trucks learn,
+   the best move for one keeps changing as the other's policy changes. With the
+   same 1M-decision budget that reliably trained one truck, the 2-truck runs
+   varied far more between seeds: one checkpoint scored over 20× another.
+3. **The reward doesn't say which truck earned it.** Both trucks receive the
+   same citywide dollars each minute, so a good move by one and a bad move by
+   the other blur together, and neither learns clearly from it.
+4. **The bar is higher than it looks.** A second truck has to beat the
+   one-truck champion by more than its own cost, not just beat no trucks.
 
+What to try next, cheapest first:
+
+- **Coordinate by planning, not by learning.** Keep the one-truck DQN as it is
+  and let the lookahead planner handle the second truck. Each idle truck takes
+  its candidate orders from the one-truck DQN, and the planner rolls each
+  candidate out with the other truck's current mission in the same simulation,
+  so an order that duplicates or undoes the other truck's work scores badly and
+  is dropped. When both trucks are idle in the same minute, the planner can
+  score pairs of orders (for example the top 4 for each truck, 16 pairs)
+  instead of single ones. This needs no new training, and the planner is
+  already the method that beat every learned policy in this project.
+- **Start 2-truck training from the champion, not from scratch.** Initialize
+  each truck's network with the one-truck DQN's weights, with the new
+  other-truck inputs starting at zero weight. Training then begins from
+  champion-level single-truck behaviour and only has to learn how to share the
+  city. Give it a larger budget and more seeds than the one-truck runs, given
+  the variance in point 2.
+- **Give each truck its own credit.** Instead of the shared citywide reward,
+  pay each truck a *difference reward*: the citywide dollars minus what they
+  would have been without that truck's mission, which the simulator can compute
+  by replaying the same minutes without it. Standard cooperative multi-agent
+  methods (value decomposition such as VDN or QMIX, or a shared critic as in
+  MAPPO) are the alternatives built for this problem.
+- **Hire the second truck only when it's needed.** The simulator hires every
+  truck for the whole day ($260 before fuel and overtime). A second truck that
+  works only the hours when crises cluster, such as the evening rush, costs
+  less and may pay where a full-day hire doesn't. This needs a shift-length
+  option in the cost model.
+
+Every 2-truck result should be judged the same way as before: the same 51-day
+test, the gain net of both trucks' costs, compared with the one-truck
+champion's $333,282.
+
+#### 3.3.2 Testing in a different season
+
+**Every result so far comes from peak season.** Training (May 1–Jul 17),
+validation (Jul 18–31) and test (Aug 1–Sep 20) all fall in Toronto's busiest
+months, and so does everything the champion was built from: the zones (demand
+patterns and rebalancing need measured over the training months), the demand
+forecast (fit on May 1–Jul 17) and the planner's demand scenarios (real days
+from Jun 1–Jul 17). The 2026 trip log shows how different the rest of the year
+is:
+
+| Month (2026) | Trips | Trips per day | Casual riders | Stations with trips |
+|---|---|---|---|---|
+| January | 137,336 | 4,430 | 8.8% | 918 |
+| February | 112,910 | 4,033 | 8.3% | 864 |
+| March | 301,827 | 9,736 | 13.2% | 1,011 |
+| April | 519,723 | 17,324 | 20.6% | 1,037 |
+| May | 856,875 | 27,641 | 29.9% | 1,043 |
+| June | 1,173,371 | 39,112 | 34.7% | 1,049 |
+| July | 1,261,716 | 40,701 | 35.9% | 1,058 |
+| August | 1,263,910 | 40,771 | 37.2% | 1,066 |
+| September | 1,202,506 | 40,084 | 33.9% | 1,077 |
+
+Winter has about a tenth of August's trips, mostly members rather than casual
+riders, on fewer active stations. Four things could stop the champion from
+beating the baseline there:
+
+1. **Less money is at stake, but the truck costs the same.** A truck still
+   costs $260 a day before fuel, but with a tenth of the rides there are far
+   fewer lost rentals and blocked returns for it to prevent. The gain over no
+   trucks could fall below the truck's cost, and then even a well-driven truck
+   loses money.
+2. **Different riders, different imbalance.** Casual riders make up 37% of
+   August trips but about 8% in January and February. Without leisure and
+   tourist trips, the stations that run empty or full, and when, may not be the
+   ones the zones and the station rule were tuned on.
+3. **Inputs the DQN has never seen.** January's fill levels, recent trip counts
+   and forecasts sit far below anything in the training months, and a neural
+   network's choices outside its training range aren't reliable.
+4. **Summer scenarios for a winter day.** The planner imagines the next 24
+   hours using real days from June and July. In January those scenarios carry
+   about ten times the real demand, so the planner would score its candidate
+   orders against the wrong future.
+
+**The test can be run with data already in hand.** January–April 2026 is in
+the same trip log, and none of it was used for training, validation, the
+forecast, the zones or the planner's scenarios, so it is a clean held-out test.
+A plan:
+
+- **Two windows**, each run like the current test (one continuous run, bikes
+  carrying over day to day): **winter, Jan–Feb**, the hardest case, and
+  **spring, Mar–Apr**, when daily trips climb from about a quarter of August's
+  level in March to over 40% in April.
+- **The same policies, unchanged:** no trucks, fixed shuttle, the DQN, and the
+  DQN + planner. For each, report the gain over no trucks, the share of
+  requests fulfilled, and the gain per day against the truck's $260 daily cost.
+- **One planner variant whose scenarios come from the previous few weeks of the
+  test season** instead of June–July. It still never sees the future, and it
+  separates point 4 from the others.
+- **The stations that actually had trips in each window**, since the winter
+  network was smaller (864 stations with trips in February vs. 1,066 in
+  August), plus a check on whether the 35% starting fill, matched to summer
+  midnights, should change.
+
+How to read the result:
+
+- **The planner still beats no trucks in winter:** the method holds across
+  seasons, the strongest result this project could add.
+- **It wins in spring but not in winter:** a fleet decision, not a model
+  failure. Hire the truck from spring to fall and park it in the coldest
+  months; the test shows where that cut-off falls.
+- **It loses in spring too:** the policy learned summer, not rebalancing. The
+  fix is to train on all seasons, with inputs that tell the network the demand
+  level (such as citywide trips over the last week, or the month), so one
+  policy can adjust.
+
+October–December isn't in this data set (the 2026 log ends Sep 30), so a fall
+test needs the rest of the year's trip data once it's published.
